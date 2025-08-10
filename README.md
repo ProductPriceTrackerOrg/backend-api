@@ -4,6 +4,12 @@
 
 This document outlines the recommended folder structure for the PricePulse FastAPI backend repository. This structure is designed to complement the frontend implementation and work alongside separate repositories for data pipeline and ML/data science tasks.
 
+```bash
+
+uvicorn app.main:app --reload
+
+```
+
 ## Repository Structure
 
 ```
@@ -369,4 +375,3 @@ services:
 - **Connection Pooling**: Database connection optimization
 - **Background Tasks**: Asynchronous processing with Celery
 - **Response Compression**: Gzip compression for large responses
-
