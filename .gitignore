@@ -21,6 +21,10 @@ var/
 *.egg
 
 gcp-credentials.json
+schema.txt
+routes.md 
+backend.md
+home_routes_implementation.md
 
 # Virtual Environment
 venv/

@@ -3,7 +3,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import users
+from app.api.v1 import users, home
 from app.config import settings
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPICallError
@@ -60,6 +60,8 @@ app.add_middleware(
 # --- API Routers ---
 # Include the user and authentication routes
 app.include_router(users.router, prefix="/api/v1", tags=["Users"])
+# Include the home routes
+app.include_router(home.router, prefix="/api/v1/home", tags=["Home"])
 
 @app.get("/check-bigquery")
 async def check_bigquery_connection():

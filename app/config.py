@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     GCP_PROJECT_ID: str
     BIGQUERY_DATASET_ID: str
     DATA_SOURCE: str = "bigquery"  # Default value
+    
+    # Redis settings (optional)
+    REDIS_URL: str = ""  # Empty string will disable Redis cache
 
     model_config = SettingsConfigDict(env_file=".env")
 
