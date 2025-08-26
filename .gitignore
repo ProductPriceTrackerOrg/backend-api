@@ -20,6 +20,8 @@ var/
 .installed.cfg
 *.egg
 
+gcp-credentials.json
+
 # Virtual Environment
 venv/
 ENV/

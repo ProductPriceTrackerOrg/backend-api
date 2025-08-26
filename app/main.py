@@ -1,9 +1,37 @@
 # app/main.py
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import users
+from app.config import settings
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+
+# --- 2. BigQuery Client Initialization ---
+# Explicitly load the credentials file
+import os
+from google.oauth2 import service_account
+
+# Path to the credentials file (adjust if necessary)
+credentials_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-credentials.json")
+
+try:
+    # Create credentials from the service account file
+    credentials = service_account.Credentials.from_service_account_file(
+        credentials_path,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    
+    # Create BigQuery client with explicit credentials
+    bq_client = bigquery.Client(
+        project=settings.GCP_PROJECT_ID,
+        credentials=credentials
+    )
+    print("Successfully connected to Google BigQuery using service account credentials.")
+except Exception as e:
+    print(f"Failed to connect to BigQuery: {e}")
+    bq_client = None
 
 app = FastAPI(
     title="PricePulse API",
@@ -32,6 +60,51 @@ app.add_middleware(
 # --- API Routers ---
 # Include the user and authentication routes
 app.include_router(users.router, prefix="/api/v1", tags=["Users"])
+
+@app.get("/check-bigquery")
+async def check_bigquery_connection():
+    """
+    This endpoint runs a simple query on your DimShop table
+    to verify the BigQuery connection and data access.
+    """
+    if not bq_client:
+        raise HTTPException(
+            status_code=500,
+            detail="BigQuery client is not initialized. Check server logs."
+        )
+
+    # A simple query to select data from one of your tables
+    query = f"""
+        SELECT shop_name, website_url
+        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop`
+        ORDER BY shop_name
+        LIMIT 10;
+    """
+
+    try:
+        print(f"Running query: {query}")
+        # Execute the query
+        query_job = bq_client.query(query)
+        # Convert the results into a list of dictionaries
+        results = [dict(row) for row in query_job.result()]
+        
+        return {
+            "status": "success",
+            "message": "Successfully connected to BigQuery and fetched data.",
+            "data": results
+        }
+        
+    except GoogleAPICallError as e:
+        # Handle potential API errors (e.g., permissions, table not found)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while querying BigQuery: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {e}"
+        )
 
 
 @app.get("/", tags=["Health Check"])
