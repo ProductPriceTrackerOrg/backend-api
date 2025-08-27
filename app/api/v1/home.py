@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from typing import Dict, List, Optional, Any
 from google.cloud import bigquery
+import supabase
 from app.config import settings
 from app.api.deps import get_current_user, get_current_admin_user, get_bigquery_client
 from app.services.cache_service import cache_service
@@ -115,12 +116,52 @@ async def get_home_stats(
         else:
             data = dict(results[0])
             
-            # TODO: For a complete implementation, we should query Supabase for the actual user count
-            # Example implementation would be:
-            # supabase_client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-            # response = supabase_client.table('profiles').select('count', count='exact').execute()
-            # user_count = response.count or 0
-            # data["total_users"] = f"{user_count}+"
+            # Query Supabase for the actual user count
+            try:
+                # Initialize Supabase client
+                supabase_client = supabase.create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+                
+                # Query the profiles table to get the count of active users
+                # Use a simpler query to avoid policy recursion issues
+                try:
+                    # Try to use a direct RPC function to avoid triggering complex policies
+                    try:
+                        # First try to use the get_active_user_count RPC function if it exists
+                        response = supabase_client.rpc('get_active_user_count').execute()
+                        
+                        # Get the count from the RPC response
+                        user_count = 0
+                        if hasattr(response, 'data') and response.data is not None:
+                            if isinstance(response.data, int):
+                                user_count = response.data
+                            elif isinstance(response.data, list) and len(response.data) > 0:
+                                user_count = response.data[0].get('count', 0)
+                    except Exception as rpc_error:
+                        print(f"RPC function error: {rpc_error}. Falling back to direct count query.")
+                        # Fallback to a direct count query with no filtering
+                        # This is less accurate but doesn't trigger policies
+                        count_response = supabase_client.table('profiles').select('*', count='exact').execute()
+                        if hasattr(count_response, 'count'):
+                            user_count = count_response.count
+                        elif hasattr(count_response, 'data') and isinstance(count_response.data, list):
+                            user_count = len(count_response.data)
+                    
+                    # Format the user count with appropriate suffix
+                    if user_count >= 1000000:
+                        data["total_users"] = f"{round(user_count / 1000000, 1)}M+"
+                    elif user_count >= 1000:
+                        data["total_users"] = f"{round(user_count / 1000, 1)}K+"
+                    else:
+                        data["total_users"] = f"{user_count}+"
+                        
+                except Exception as inner_error:
+                    print(f"Error with Supabase query: {inner_error}")
+                    data["total_users"] = "100K+"  # Fallback to hardcoded value
+                    
+            except Exception as e:
+                # Log the error but continue with the hardcoded value
+                print(f"Error setting up Supabase client: {e}")
+                data["total_users"] = "100K+"  # Fallback to hardcoded value
             
         # Cache the data for 1 hour (3600 seconds)
         cache_service.set(cache_key, data, 3600)
@@ -182,13 +223,13 @@ async def get_home_categories(
         query_job = bq_client.query(query)
         results = [dict(row) for row in query_job.result()]
         
-        # Format product count to human-readable format
+        # Format product count to human-readable format with better precision
         for category in results:
             count = category['product_count']
             if count >= 1000000:
-                category['product_count'] = f"{count // 1000000}M+"
+                category['product_count'] = f"{round(count / 1000000, 1)}M+"
             elif count >= 1000:
-                category['product_count'] = f"{count // 1000}K+"
+                category['product_count'] = f"{round(count / 1000, 1)}K+"
             else:
                 category['product_count'] = f"{count}+"
                 
