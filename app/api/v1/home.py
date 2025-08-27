@@ -319,41 +319,68 @@ async def get_trending_products(
     try:
         if type == "trends":
             query = f"""
+            WITH
+              -- Step 1: Calculate a real "trending score" based on the number of price updates in the last 7 days.
+              TrendingScores AS (
+                SELECT
+                  fpp.variant_id,
+                  COUNT(fpp.price_fact_id) AS trend_score -- Count of updates reflects market activity
+                FROM
+                  `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS dd ON fpp.date_id = dd.date_id
+                WHERE dd.full_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                GROUP BY fpp.variant_id
+              ),
+
+              -- Step 2: Get the single most recent price record for EVERY variant. This prevents duplicates.
+              LatestPrices AS (
+                SELECT
+                  variant_id,
+                  current_price,
+                  original_price,
+                  is_available
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS dd ON fpp.date_id = dd.date_id
+                -- The QUALIFY clause filters the results of a window function.
+                -- It's like a HAVING clause for window functions.
+                QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date DESC) = 1
+              )
+
+            -- Step 3: Join the trending scores and latest prices with product details.
             SELECT
-                sp.shop_product_id as id,
-                sp.product_title_native as name,
-                sp.brand_native as brand,
-                c.category_name as category,
-                v.variant_id,
-                v.variant_title,
-                s.shop_name as retailer,
-                s.shop_id as retailer_id,
-                fpp.current_price as price,
-                fpp.original_price,
-                fpp.is_available as in_stock,
-                pi.image_url as image,
-                CASE
-                    WHEN fpp.original_price > 0
-                    THEN ROUND(((fpp.original_price - fpp.current_price) / fpp.original_price) * 100, 0)
-                    ELSE 0
-                END as discount,
-                AVG(pa.anomaly_score) as trend_score,
-                CONCAT('+', CAST(ROUND(RAND() * 200 + 50, 0) AS STRING), '%') as search_volume,
-                ROUND(fpp.original_price - fpp.current_price, 2) as price_change,
-                TRUE as is_trending
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` pa ON fpp.price_fact_id = pa.price_fact_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
-            WHERE fpp.is_available = TRUE
-            GROUP BY 
-                sp.shop_product_id, sp.product_title_native, sp.brand_native, c.category_name, 
-                v.variant_id, v.variant_title, s.shop_name, s.shop_id, 
-                fpp.current_price, fpp.original_price, fpp.is_available, pi.image_url
-            ORDER BY trend_score DESC
+              sp.shop_product_id AS id,
+              sp.product_title_native AS name,
+              sp.brand_native AS brand,
+              c.category_name AS category,
+              v.variant_id,
+              v.variant_title,
+              s.shop_name AS retailer,
+              s.shop_id AS retailer_id,
+              lp.current_price AS price,
+              lp.original_price,
+              lp.is_available AS in_stock,
+              pi.image_url AS image,
+              ts.trend_score, -- Use our new, meaningful score
+              CASE
+                WHEN lp.original_price > 0 AND lp.original_price > lp.current_price
+                THEN ROUND(((lp.original_price - lp.current_price) / lp.original_price) * 100, 0)
+                ELSE 0
+              END AS discount,
+              CONCAT('+', CAST(ROUND(RAND() * 200 + 50, 0) AS STRING), '%') as search_volume,
+              ROUND(COALESCE(lp.original_price, lp.current_price) - lp.current_price, 2) AS price_change,
+              TRUE AS is_trending -- Static flag to identify this result type
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+            JOIN TrendingScores AS ts ON v.variant_id = ts.variant_id -- Join our calculated trend scores
+            JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id -- Join the latest price for each variant
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            WHERE
+              lp.is_available = TRUE -- Only show trending products that are in stock
+            ORDER BY
+              ts.trend_score DESC, lp.current_price ASC
             LIMIT {limit}
             """
             
@@ -370,43 +397,59 @@ async def get_trending_products(
             }
         else:  # type == "launches"
             query = f"""
-            WITH RecentProducts AS (
+            WITH
+              -- Step 1: Identify products first seen within the last 30 days.
+              RecentProducts AS (
                 SELECT
-                    sp.shop_product_id,
-                    sp.product_title_native,
-                    sp.brand_native,
-                    c.category_name,
-                    MIN(d.full_date) as first_seen_date
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON fpp.date_id = d.date_id
-                GROUP BY sp.shop_product_id, sp.product_title_native, sp.brand_native, c.category_name
+                  sp.shop_product_id,
+                  MIN(d.full_date) AS first_seen_date
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp ON v.variant_id = fpp.variant_id
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS d ON fpp.date_id = d.date_id
+                GROUP BY sp.shop_product_id
                 HAVING DATE_DIFF(CURRENT_DATE(), MIN(d.full_date), DAY) <= 30
-            )
-            
+              ),
+
+              -- Step 2: Get the single most recent price for ALL variants to avoid duplicates.
+              LatestPrices AS (
+                SELECT
+                  variant_id,
+                  current_price,
+                  is_available
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS dd ON fpp.date_id = dd.date_id
+                QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date DESC) = 1
+              )
+
+            -- Step 3: Join the recent products with their details and latest price.
             SELECT
-                rp.shop_product_id as id,
-                rp.product_title_native as name,
-                rp.brand_native as brand,
-                rp.category_name as category,
-                fpp.current_price as price,
-                s.shop_name as retailer,
-                s.shop_id as retailer_id,
-                TRUE as in_stock,
-                pi.image_url as image,
-                rp.first_seen_date as launch_date,
-                CAST(ROUND(RAND() * 20000 + 5000, 0) AS INT64) as pre_orders,
-                4.0 + RAND() * 1.0 as rating,
-                TRUE as is_new
-            FROM RecentProducts rp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON rp.shop_product_id = sp.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
-            ORDER BY rp.first_seen_date DESC
+              rp.shop_product_id AS id,
+              sp.product_title_native AS name,
+              sp.brand_native AS brand,
+              c.category_name AS category,
+              lp.current_price AS price,
+              s.shop_name AS retailer,
+              s.shop_id AS retailer_id,
+              lp.is_available AS in_stock,
+              pi.image_url AS image,
+              rp.first_seen_date AS launch_date,
+              CAST(ROUND(RAND() * 20000 + 5000, 0) AS INT64) as pre_orders,
+              4.0 + RAND() * 1.0 as rating,
+              TRUE AS is_new -- Static flag to identify this result type
+            FROM
+              RecentProducts AS rp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp ON rp.shop_product_id = sp.shop_product_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+            -- We must join through DimVariant to link a product to its prices
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
+            JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            WHERE
+              lp.is_available = TRUE -- Only show new launches that are in stock
+            ORDER BY
+              rp.first_seen_date DESC
             LIMIT {limit}
             """
             
