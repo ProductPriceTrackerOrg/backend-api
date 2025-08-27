@@ -1,9 +1,12 @@
 # app/api/deps.py
 
 import time
+import os
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 from app.config import settings
 
@@ -59,3 +62,29 @@ async def get_current_admin_user(current_user: dict = Depends(get_current_user))
         )
 
     return current_user
+
+def get_bigquery_client():
+    """
+    Returns a BigQuery client using the service account credentials.
+    """
+    try:
+        # Path to the credentials file
+        credentials_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "gcp-credentials.json")
+        
+        # Create credentials from the service account file
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        
+        # Create and return BigQuery client
+        client = bigquery.Client(
+            project=settings.GCP_PROJECT_ID,
+            credentials=credentials
+        )
+        return client
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create BigQuery client: {e}"
+        )
