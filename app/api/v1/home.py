@@ -35,46 +35,69 @@ async def get_home_stats(
         return cached_data
     
     try:
-        # Query to get aggregated statistics
+        # Query the Supabase database for user count via an HTTP call
+        # This would typically be done using a repository pattern or a database access service
+        # For now, we'll skip implementing this and use a placeholder
+        
+        # Improved query to get accurate warehouse statistics
         query = f"""
-        WITH ProductCount AS (
-            SELECT COUNT(DISTINCT shop_product_id) as count 
+        WITH
+          ProductCount AS (
+            SELECT COUNT(DISTINCT shop_product_id) AS count
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct`
-        ),
-        CategoryCount AS (
-            SELECT COUNT(*) as count 
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` 
-            WHERE parent_category_id IS NULL
-        ),
-        ShopCount AS (
-            SELECT COUNT(*) as count 
+          ),
+          CategoryCount AS (
+            SELECT COUNT(DISTINCT category_id) AS count
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory`
+            WHERE parent_category_id IS NULL -- Counts only top-level categories
+          ),
+          ShopCount AS (
+            SELECT COUNT(DISTINCT shop_id) AS count
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop`
-        ),
-        TodayPriceUpdates AS (
-            SELECT COUNT(*) as count 
+          ),
+          TodayPriceUpdates AS (
+            SELECT COUNT(*) AS count
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd
-            ON fpp.date_id = dd.date_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON fpp.date_id = dd.date_id
             WHERE dd.full_date = CURRENT_DATE()
-        ),
-        ActiveDeals AS (
-            SELECT COUNT(*) as count 
+          ),
+          ActiveDeals AS (
+            SELECT COUNT(*) AS count
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
-            WHERE current_price < original_price AND is_available = TRUE
-        )
-        SELECT 
-            FORMAT("%d+", CAST(pc.count/1000 AS INT64)) || 'K' as total_products,
-            FORMAT("%d+", cc.count) as product_categories,
-            '100K+' as total_users,
-            FORMAT("%d+", sc.count) as total_suppliers,
-            FORMAT("%d+", CAST(tpu.count/1000 AS INT64)) || 'K' as price_updates_today,
-            FORMAT("%d+", CAST(ad.count/1000 AS INT64)) || 'K' as active_deals
-        FROM 
-            ProductCount pc,
-            CategoryCount cc,
-            ShopCount sc,
-            TodayPriceUpdates tpu,
-            ActiveDeals ad
+            WHERE is_available = TRUE AND original_price IS NOT NULL AND current_price < original_price
+          )
+        SELECT
+          -- Use CASE statements for robust and readable number formatting
+          CASE
+            WHEN pc.count >= 1000000 THEN FORMAT('%.1fM+', ROUND(pc.count / 1000000, 1))
+            WHEN pc.count >= 1000 THEN FORMAT('%.1fK+', ROUND(pc.count / 1000, 1))
+            ELSE CAST(pc.count AS STRING)
+          END AS total_products,
+        
+          CAST(cc.count AS STRING) || '+' AS product_categories,
+          
+          -- Placeholder for total_users (to be implemented with Supabase integration)
+          '100K+' AS total_users,
+          
+          CAST(sc.count AS STRING) || '+' AS total_suppliers,
+        
+          CASE
+            WHEN tpu.count >= 1000000 THEN FORMAT('%.1fM+', ROUND(tpu.count / 1000000, 1))
+            WHEN tpu.count >= 1000 THEN FORMAT('%.1fK+', ROUND(tpu.count / 1000, 1))
+            ELSE CAST(tpu.count AS STRING)
+          END || '+' AS price_updates_today,
+        
+          CASE
+            WHEN ad.count >= 1000000 THEN FORMAT('%.1fM+', ROUND(ad.count / 1000000, 1))
+            WHEN ad.count >= 1000 THEN FORMAT('%.1fK+', ROUND(ad.count / 1000, 1))
+            ELSE CAST(ad.count AS STRING)
+          END || '+' AS active_deals
+        FROM
+          ProductCount pc,
+          CategoryCount cc,
+          ShopCount sc,
+          TodayPriceUpdates tpu,
+          ActiveDeals ad
         """
         
         query_job = bq_client.query(query)
@@ -84,13 +107,20 @@ async def get_home_stats(
             data = {
                 "total_products": "0+",
                 "product_categories": "0+",
-                "total_users": "0+",
+                "total_users": "0+", 
                 "total_suppliers": "0+",
                 "price_updates_today": "0+",
                 "active_deals": "0+"
             }
         else:
             data = dict(results[0])
+            
+            # TODO: For a complete implementation, we should query Supabase for the actual user count
+            # Example implementation would be:
+            # supabase_client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+            # response = supabase_client.table('profiles').select('count', count='exact').execute()
+            # user_count = response.count or 0
+            # data["total_users"] = f"{user_count}+"
             
         # Cache the data for 1 hour (3600 seconds)
         cache_service.set(cache_key, data, 3600)
