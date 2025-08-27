@@ -1,5 +1,9 @@
 # PricePulse Backend - File & Folder Structure
 
+## Important
+
+`have to implement the personalized recomendation and search paet in the home page`
+
 ## Overview
 
 This document outlines the recommended folder structure for the PricePulse FastAPI backend repository. This structure is designed to complement the frontend implementation and work alongside separate repositories for data pipeline and ML/data science tasks.
