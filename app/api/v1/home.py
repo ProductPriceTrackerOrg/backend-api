@@ -578,76 +578,82 @@ async def get_price_changes(
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:
     """
-    Get products with price drops or price increases.
+    Get products with the most significant price drops or increases from the last available day.
+    This implementation uses a single, efficient query.
     """
     try:
-        # Get the last two date_ids to compare prices
-        date_query = f"""
-        SELECT date_id
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate`
-        ORDER BY full_date DESC
-        LIMIT 2
-        """
-        date_job = bq_client.query(date_query)
-        date_results = list(date_job.result())
-        
-        if len(date_results) < 2:
-            raise HTTPException(
-                status_code=500,
-                detail="Not enough date data available to calculate price changes"
-            )
-        
-        current_date_id = date_results[0]['date_id']
-        previous_date_id = date_results[1]['date_id']
-        
-        comparison_operator = "<" if type == "drops" else ">"
-        
+        # The dynamic part of the query changes based on the 'type' parameter.
+        change_filter = "pc.percentage_change < 0" if type == "drops" else "pc.percentage_change > 0"
+
+        # This single, robust query handles all the logic in the database.
         query = f"""
-        WITH PriceChanges AS (
+        WITH
+          -- Step 1: Use a window function to get each variant's price and the price from the previous day in one row.
+          DailyPriceComparison AS (
             SELECT
-                sp.shop_product_id as id,
-                sp.product_title_native as name,
-                sp.brand_native as brand,
-                c.category_name as category,
-                current_prices.current_price,
-                previous_prices.current_price as previous_price,
-                (current_prices.current_price - previous_prices.current_price) as price_change,
-                ROUND(((current_prices.current_price - previous_prices.current_price) / 
-                      NULLIF(previous_prices.current_price, 0)) * 100, 2) as percentage_change,
-                s.shop_name as retailer,
-                s.shop_id as retailer_id,
-                pi.image_url as image,
-                d.full_date as change_date,
-                current_prices.is_available as in_stock
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
-            JOIN (
-                SELECT variant_id, current_price, date_id, is_available
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
-                WHERE date_id = {current_date_id}
-            ) current_prices ON v.variant_id = current_prices.variant_id
-            JOIN (
-                SELECT variant_id, current_price
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
-                WHERE date_id = {previous_date_id}
-            ) previous_prices ON v.variant_id = previous_prices.variant_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON current_prices.date_id = d.date_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
-            WHERE current_prices.current_price != previous_prices.current_price
-        )
-        SELECT * FROM PriceChanges
-        WHERE price_change {comparison_operator} 0
-        ORDER BY ABS(percentage_change) DESC
+              fpp.variant_id,
+              dd.full_date AS current_date,
+              fpp.current_price AS current_price,
+              -- LAG() function looks back one row within the partition to get the previous price.
+              LAG(fpp.current_price, 1) OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date) AS previous_price
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
+            JOIN
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON fpp.date_id = dd.date_id
+            -- This ensures we only consider the LATEST price if there are multiple on the same day.
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id, dd.full_date ORDER BY fpp.price_fact_id DESC) = 1
+          ),
+
+          -- Step 2: Calculate the changes and filter for only the most recent day's activity.
+          PriceChanges AS (
+            SELECT
+              variant_id,
+              current_price,
+              previous_price,
+              (current_price - previous_price) AS price_change,
+              ROUND(((current_price - previous_price) / NULLIF(previous_price, 0)) * 100, 2) AS percentage_change,
+              current_date AS change_date
+            FROM
+              DailyPriceComparison
+            WHERE
+              previous_price IS NOT NULL AND current_price != previous_price
+              AND current_date = (SELECT MAX(full_date) FROM `pricepulse_analytics.DimDate`)
+          )
+
+        -- Step 3: Join the calculated changes with the product dimension data for the final output.
+        SELECT
+          sp.shop_product_id AS id,
+          sp.product_title_native AS name,
+          sp.brand_native AS brand,
+          c.category_name AS category,
+          pc.current_price,
+          pc.previous_price,
+          pc.price_change,
+          pc.percentage_change,
+          s.shop_name AS retailer,
+          s.shop_id AS retailer_id,
+          pi.image_url AS image,
+          pc.change_date,
+          TRUE AS in_stock -- Assuming changes are only tracked for available items
+        FROM
+          PriceChanges pc
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON pc.variant_id = v.variant_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON v.shop_product_id = sp.shop_product_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        WHERE
+          {change_filter} -- Apply the filter for "drops" or "increases"
+        ORDER BY
+          ABS(pc.percentage_change) DESC -- Order by the magnitude of the change
         LIMIT {limit}
         """
-        
+
         query_job = bq_client.query(query)
         results = [dict(row) for row in query_job.result()]
-        
+
         return {"price_changes": results}
-        
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
