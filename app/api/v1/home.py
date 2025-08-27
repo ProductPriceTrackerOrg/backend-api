@@ -483,50 +483,83 @@ async def get_latest_products(
     """
     try:
         query = f"""
-        WITH LatestProducts AS (
+        WITH
+          -- Step 1: Find the actual first-seen date for every product in the warehouse.
+          -- This is the true definition of a product's "added_date".
+          ProductFirstSeen AS (
             SELECT
-                sp.shop_product_id,
-                sp.product_title_native,
-                sp.brand_native,
-                c.category_name,
-                CURRENT_TIMESTAMP() as added_date,
-                ROW_NUMBER() OVER (PARTITION BY sp.shop_id ORDER BY sp.shop_product_id DESC) as row_num
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
-        )
-        
+              sp.shop_product_id,
+              MIN(d.full_date) AS first_seen_date
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp ON v.variant_id = fpp.variant_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS d ON fpp.date_id = d.date_id
+            GROUP BY
+              sp.shop_product_id
+          ),
+
+          -- Step 2: Get the single, most recent price for EVERY product variant.
+          -- This is essential to prevent duplicate rows in the final result.
+          LatestVariantPrices AS (
+            SELECT
+              variant_id,
+              current_price,
+              original_price,
+              is_available
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON fpp.date_id = dd.date_id
+            -- This QUALIFY clause selects only the row with the most recent date for each variant_id.
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date DESC) = 1
+          )
+
+        -- Step 3: Combine the data, ensuring one row per product, ordered by when it was first seen.
         SELECT
-            lp.shop_product_id as id,
-            lp.product_title_native as name,
-            lp.brand_native as brand,
-            lp.category_name as category,
-            fpp.current_price as price,
-            fpp.original_price,
-            s.shop_name as retailer,
-            s.shop_id as retailer_id,
-            fpp.is_available as in_stock,
-            pi.image_url as image,
-            CASE
-                WHEN fpp.original_price > 0
-                THEN ROUND(((fpp.original_price - fpp.current_price) / fpp.original_price) * 100, 0)
-                ELSE 0
-            END as discount,
-            4.0 + RAND() * 1.0 as rating,
-            CAST(ROUND(RAND() * 2000 + 100, 0) AS INT64) as reviews_count,
-            lp.added_date
-        FROM LatestProducts lp
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON lp.shop_product_id = sp.shop_product_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
-        WHERE lp.row_num <= {limit}
-        ORDER BY lp.added_date DESC
+          sp.shop_product_id AS id,
+          sp.product_title_native AS name,
+          sp.brand_native AS brand,
+          c.category_name AS category,
+          lvp.current_price AS price,
+          lvp.original_price,
+          s.shop_name AS retailer,
+          s.shop_id AS retailer_id,
+          lvp.is_available AS in_stock,
+          pi.image_url AS image,
+          CAST(pfs.first_seen_date AS STRING) AS added_date,
+          CASE
+            WHEN lvp.original_price > 0 AND lvp.original_price > lvp.current_price
+            THEN ROUND(((lvp.original_price - lvp.current_price) / lvp.original_price) * 100, 0)
+            ELSE 0
+          END AS discount,
+          4.0 + RAND() * 1.0 as rating,
+          CAST(ROUND(RAND() * 2000 + 100, 0) AS INT64) as reviews_count
+        FROM
+          `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
+        -- Join with our CTEs and other dimension tables to get all the details
+        JOIN ProductFirstSeen AS pfs ON sp.shop_product_id = pfs.shop_product_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
+        JOIN LatestVariantPrices AS lvp ON v.variant_id = lvp.variant_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        WHERE
+          lvp.is_available = TRUE -- Only show products that are currently in stock
+        -- This final QUALIFY ensures we only get one row per product (shop_product_id),
+        -- picking the variant with the lowest price if a product has multiple.
+        QUALIFY ROW_NUMBER() OVER(PARTITION BY sp.shop_product_id ORDER BY lvp.current_price ASC) = 1
+        ORDER BY
+          pfs.first_seen_date DESC
         LIMIT {limit}
         """
         
         query_job = bq_client.query(query)
         results = [dict(row) for row in query_job.result()]
+        
+        # Ensure date fields are properly formatted as strings
+        for product in results:
+            if 'added_date' in product and not isinstance(product['added_date'], str):
+                product['added_date'] = str(product['added_date'])
         
         return {"products": results}
         
