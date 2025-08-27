@@ -186,37 +186,101 @@ async def get_home_categories(
     """
     try:
         query = f"""
+        -- This query is designed to get the top trending parent categories
+        -- with accurate product counts and a logical trending score.
+        WITH
+          -- Step 1: Map all subcategories to their top-level parent category.
+          -- This is crucial for correctly aggregating data upwards.
+          CategoryHierarchy AS (
+            SELECT
+              sub.category_id AS sub_category_id,
+              parent.category_id AS parent_category_id,
+              parent.category_name AS parent_category_name
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS sub
+            JOIN
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS parent ON sub.parent_category_id = parent.category_id
+            WHERE
+              parent.parent_category_id IS NULL
+            -- Also include the parent categories themselves in the mapping
+            UNION ALL
+            SELECT
+              category_id AS sub_category_id,
+              category_id AS parent_category_id,
+              category_name AS parent_category_name
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory`
+            WHERE
+              parent_category_id IS NULL
+          ),
+
+          -- Step 2: Calculate a "trending score" based on recent price updates.
+          -- A higher number of price changes in the last 7 days indicates more market activity.
+          CategoryActivityScore AS (
+            SELECT
+              ch.parent_category_id,
+              COUNT(fpp.price_fact_id) AS recent_updates_count
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS dd ON fpp.date_id = dd.date_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS dv ON fpp.variant_id = dv.variant_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS dsp ON dv.shop_product_id = dsp.shop_product_id
+            JOIN CategoryHierarchy AS ch ON dsp.predicted_master_category_id = ch.sub_category_id
+            WHERE
+              -- Look at activity in the last 7 days from today
+              dd.full_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+            GROUP BY
+              ch.parent_category_id
+          ),
+
+          -- Step 3: Calculate the total product count for each parent category.
+          CategoryProductCount AS (
+            SELECT
+              ch.parent_category_id,
+              COUNT(DISTINCT dsp.shop_product_id) AS total_product_count
+            FROM
+              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS dsp
+            JOIN
+              CategoryHierarchy AS ch ON dsp.predicted_master_category_id = ch.sub_category_id
+            GROUP BY
+              ch.parent_category_id
+          )
+
+        -- Step 4: Combine all the pre-calculated data for the final result.
         SELECT
-            c.category_id,
-            c.category_name as name,
-            COUNT(DISTINCT sp.shop_product_id) as product_count,
-            COALESCE(AVG(pa.anomaly_score), 0) as trending_score,
-            -- Static values for demo purposes, in production these would come from your database
-            CASE
-                WHEN c.category_name LIKE '%phone%' THEN 'smartphone'
-                WHEN c.category_name LIKE '%laptop%' THEN 'laptop'
-                WHEN c.category_name LIKE '%watch%' THEN 'watch'
-                WHEN c.category_name LIKE '%tablet%' THEN 'tablet'
-                WHEN c.category_name LIKE '%camera%' THEN 'camera'
-                WHEN c.category_name LIKE '%headphone%' THEN 'headphone'
-                ELSE 'gadget'
-            END as icon,
-            CONCAT('/category/', LOWER(REPLACE(c.category_name, ' ', '-'))) as href,
-            CASE
-                WHEN c.category_id % 5 = 0 THEN 'blue'
-                WHEN c.category_id % 5 = 1 THEN 'green'
-                WHEN c.category_id % 5 = 2 THEN 'red'
-                WHEN c.category_id % 5 = 3 THEN 'purple'
-                ELSE 'orange'
-            END as color
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON c.category_id = sp.predicted_master_category_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` pa ON fpp.price_fact_id = pa.price_fact_id
-        WHERE c.parent_category_id IS NULL
-        GROUP BY c.category_id, c.category_name
-        ORDER BY trending_score DESC
+          parent_cat.category_id,
+          parent_cat.category_name AS name,
+          -- Use COALESCE to show 0 if a category has no products
+          COALESCE(pc.total_product_count, 0) AS product_count,
+          -- The trending score is our new, more logical metric
+          COALESCE(cas.recent_updates_count, 0) AS trending_score,
+          -- UI logic for icons, hrefs, and colors
+          CASE
+            WHEN parent_cat.category_name LIKE '%phone%' THEN 'smartphone'
+            WHEN parent_cat.category_name LIKE '%laptop%' THEN 'laptop'
+            WHEN parent_cat.category_name LIKE '%watch%' THEN 'watch'
+            WHEN parent_cat.category_name LIKE '%tablet%' THEN 'tablet'
+            WHEN parent_cat.category_name LIKE '%camera%' THEN 'camera'
+            WHEN parent_cat.category_name LIKE '%Accessories%' THEN 'headphone'
+            ELSE 'gadget'
+          END AS icon,
+          CONCAT('/category/', LOWER(REPLACE(parent_cat.category_name, ' ', '-'))) AS href,
+          CASE
+            WHEN MOD(parent_cat.category_id, 5) = 0 THEN 'blue'
+            WHEN MOD(parent_cat.category_id, 5) = 1 THEN 'green'
+            WHEN MOD(parent_cat.category_id, 5) = 2 THEN 'red'
+            WHEN MOD(parent_cat.category_id, 5) = 3 THEN 'purple'
+            ELSE 'orange'
+          END AS color
+        FROM
+          `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS parent_cat
+        -- Join our aggregated data back to the parent category dimension
+        LEFT JOIN CategoryProductCount AS pc ON parent_cat.category_id = pc.parent_category_id
+        LEFT JOIN CategoryActivityScore AS cas ON parent_cat.category_id = cas.parent_category_id
+        WHERE
+          parent_cat.parent_category_id IS NULL -- Ensure we only return top-level categories
+        ORDER BY
+          trending_score DESC, product_count DESC -- Order by trending score, then by product count
         LIMIT {limit}
         """
         
