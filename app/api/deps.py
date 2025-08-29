@@ -6,6 +6,8 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from fastapi.security import OAuth2PasswordBearer
+from typing import Optional
+from fastapi import Request, Depends
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -69,6 +71,45 @@ async def get_current_admin_user(current_user: dict = Depends(get_current_user))
         )
 
     return current_user
+
+async def get_current_user_optional(request: Request) -> Optional[dict]:
+    """
+    Attempts to get the current user from the Authorization header.
+
+    If a valid token is present, it returns the user's data (payload).
+    If no token is present or the token is invalid, it returns None.
+    This dependency WILL NOT raise an error.
+    """
+    try:
+        # Get the token from the "Authorization: Bearer <token>" header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return None
+
+        token_type, _, token = auth_header.partition(" ")
+        if token_type.lower() != "bearer" or not token:
+            return None
+
+        # Decode and validate the token
+        payload = jwt.decode(
+            token,
+            settings.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_signature": True, "verify_aud": False, "verify_exp": True}
+        )
+        
+        # Check if the user ID (sub) exists in the payload
+        if payload.get("sub") is None:
+            return None
+            
+        return payload
+
+    except JWTError:
+        # If any validation error occurs (expired, invalid signature, etc.)
+        return None
+    except Exception:
+        # For any other unexpected errors
+        return None
 
 def get_bigquery_client():
     """

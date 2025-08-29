@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Any
 from google.cloud import bigquery
 import supabase
 from app.config import settings
-from app.api.deps import get_current_user, get_bigquery_client
+from app.api.deps import get_current_user, get_bigquery_client, get_current_user_optional
 from app.services.cache_service import cache_service
 from app.schemas.product import (
     ProductDetailsResponse, 
@@ -36,7 +36,7 @@ async def get_product_details(
     product_id: int = Path(..., description="The ID of the product to retrieve"),
     retailer_id: Optional[int] = Query(None, description="Filter by specific retailer"),
     response: Response = None,
-    current_user: Optional[Dict] = Depends(get_current_user),
+    current_user: Optional[Dict] = Depends(get_current_user_optional),
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:
     """
