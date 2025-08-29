@@ -166,3 +166,4 @@ class FavoriteResponse(BaseModel):
 class ViewLogResponse(BaseModel):
     """Response for the view log endpoint"""
     logged: bool
+    variant_id: Optional[int] = None

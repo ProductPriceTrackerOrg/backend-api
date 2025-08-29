@@ -151,7 +151,7 @@ async def get_product_details(
                 user_id = current_user.get("sub")
                 
                 # Check if ANY of this product's variants are in the user's favorites list
-                response = supabase_client.table("UserFavorites") \
+                response = supabase_client.table("userfavorites") \
                     .select("variant_id", count='exact') \
                     .eq("user_id", user_id) \
                     .in_("variant_id", all_variant_ids) \
@@ -965,7 +965,7 @@ async def add_to_favorites(
         variant_id = variant_results[0]["variant_id"]
         
         # Check if already favorited
-        check_response = supabase_client.table("UserFavorites") \
+        check_response = supabase_client.table("userfavorites") \
             .select("favorite_id") \
             .eq("user_id", user_id) \
             .eq("variant_id", variant_id) \
@@ -978,7 +978,7 @@ async def add_to_favorites(
             }
         
         # Add to favorites
-        insert_response = supabase_client.table("UserFavorites") \
+        insert_response = supabase_client.table("userfavorites") \
             .insert({
                 "user_id": user_id,
                 "variant_id": variant_id
@@ -1046,7 +1046,7 @@ async def remove_from_favorites(
         variant_ids = [row["variant_id"] for row in variant_results]
         
         # Remove from favorites
-        delete_response = supabase_client.table("UserFavorites") \
+        delete_response = supabase_client.table("userfavorites") \
             .delete() \
             .eq("user_id", user_id) \
             .in_("variant_id", variant_ids) \
@@ -1069,62 +1069,45 @@ async def remove_from_favorites(
 @router.post("/{product_id}/view", response_model=ViewLogResponse)
 async def log_product_view(
     product_id: int = Path(..., description="The ID of the product viewed"),
+    # The variant_id is now required from the frontend for accuracy.
+    variant_id: int = Query(..., description="Specific variant ID that was viewed"),
     session_id: Optional[str] = Query(None, description="Session ID for anonymous users"),
-    variant_id: Optional[int] = Query(None, description="Specific variant viewed"),
     current_user: Optional[Dict] = Depends(get_current_user),
     supabase_client = Depends(get_supabase_client)
 ) -> Dict:
     """
-    Log that a user viewed a product.
-    
-    This helps with personalized recommendations and analytics.
+    Log that a user viewed a specific product variant.
+    This is a fast, lightweight endpoint that writes directly to the operational database.
     """
     try:
-        user_id = None
-        if current_user:
-            user_id = current_user.get("sub")
-        
-        # If no session_id and no user_id, we can't log the view
+        user_id = current_user.get("sub") if current_user else None
+
+        # Either a session_id (for anonymous users) or a user_id (for logged-in users) is required.
         if not session_id and not user_id:
             raise HTTPException(
                 status_code=400,
-                detail="Either session_id or authentication is required"
+                detail="Either session_id or user authentication is required to log a view."
             )
-        
-        # If variant_id is not provided, try to get it from the product
-        if not variant_id:
-            variant_query = f"""
-            SELECT v.variant_id
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-            WHERE sp.shop_product_id = {product_id}
-            LIMIT 1
-            """
-            
-            bq_client = get_bigquery_client()
-            variant_job = bq_client.query(variant_query)
-            variant_results = list(variant_job.result())
-            
-            if variant_results:
-                variant_id = variant_results[0]["variant_id"]
-        
-        # Log the view
-        insert_response = supabase_client.table("UserActivityLog") \
-            .insert({
-                "user_id": user_id,
-                "session_id": session_id,
-                "activity_type": "PRODUCT_VIEW",
-                "variant_id": variant_id
-            }) \
-            .execute()
-        
-        if not insert_response.data:
-            raise HTTPException(
+
+        # The BigQuery call is completely removed. We now log the exact variant_id provided.
+        log_entry = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "activity_type": "PRODUCT_VIEW",
+            "variant_id": variant_id
+        }
+
+        # Log the view event to the useractivitylog table in Supabase.
+        insert_response = supabase_client.table("useractivitylog").insert(log_entry).execute()
+
+        # Check for errors from Supabase (e.g., RLS issues, invalid variant_id if you have foreign keys)
+        if insert_response.data is None and insert_response.error:
+            raise HTTPException( 
                 status_code=500,
-                detail="Failed to log product view"
+                detail=f"Failed to log product view: {insert_response.error.message}"
             )
-        
-        return {"logged": True}
+
+        return {"logged": True, "variant_id": variant_id}
         
     except HTTPException:
         raise
