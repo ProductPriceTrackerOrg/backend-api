@@ -65,6 +65,55 @@ app.include_router(home.router, prefix="/api/v1/home", tags=["Home"])
 # Include the product routes
 from app.api.v1 import products
 app.include_router(products.router, prefix="/api/v1/products", tags=["Products"])
+# Include debug routes for troubleshooting
+from app.api.v1 import debug
+app.include_router(debug.router, prefix="/api/v1/debug", tags=["Debug"])
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint that verifies all components are operational.
+    """
+    health = {
+        "status": "healthy",
+        "api_version": "1.0.0",
+        "components": {
+            "bigquery": {"status": "unknown", "error": None},
+            "settings": {"status": "ok", "config": {
+                "supabase_url": bool(settings.SUPABASE_URL),
+                "supabase_key": bool(settings.SUPABASE_KEY),
+                "supabase_jwt_secret": bool(settings.SUPABASE_JWT_SECRET),
+                "gcp_project": bool(settings.GCP_PROJECT_ID),
+                "redis_url": bool(settings.REDIS_URL)
+            }}
+        }
+    }
+    
+    # Check BigQuery connection
+    try:
+        if not bq_client:
+            health["components"]["bigquery"]["status"] = "error"
+            health["components"]["bigquery"]["error"] = "BigQuery client not initialized"
+            health["status"] = "degraded"
+        else:
+            # A simple query to select data from one of your tables
+            query = f"""
+                SELECT COUNT(*) as count 
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop`
+                LIMIT 1;
+            """
+            
+            query_job = bq_client.query(query)
+            result = next(query_job.result())
+            
+            health["components"]["bigquery"]["status"] = "ok" 
+            health["components"]["bigquery"]["shop_count"] = result.count
+    except Exception as e:
+        health["components"]["bigquery"]["status"] = "error"
+        health["components"]["bigquery"]["error"] = str(e)
+        health["status"] = "degraded"
+    
+    return health
 
 @app.get("/check-bigquery")
 async def check_bigquery_connection():

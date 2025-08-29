@@ -26,17 +26,28 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         # CHANGE 4: The token is now inside the credentials object
         token = credentials.credentials
         
-        # The rest of the logic remains the same
+        # Modified to handle Supabase JWT format - setting options
         payload = jwt.decode(
             token,
             settings.SUPABASE_JWT_SECRET,
-            algorithms=["HS256"]
+            algorithms=["HS256"],
+            options={"verify_signature": True, "verify_aud": False, "verify_exp": True}
         )
         if payload.get("sub") is None:
             raise credentials_exception
+        
+        # Log successful authentication for debugging
+        print(f"Successfully authenticated user: {payload.get('email')}")
+        
         return payload
-    except JWTError:
-        raise credentials_exception
+    except JWTError as e:
+        # Add more detailed error logging
+        print(f"JWT verification failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token validation failed: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 # --- Dependency for Admin-Only Routes (NO CHANGES NEEDED HERE) ---
 async def get_current_admin_user(current_user: dict = Depends(get_current_user)) -> dict:
