@@ -62,6 +62,9 @@ app.add_middleware(
 app.include_router(users.router, prefix="/api/v1", tags=["Users"])
 # Include the home routes
 app.include_router(home.router, prefix="/api/v1/home", tags=["Home"])
+# Include the product routes
+from app.api.v1 import products
+app.include_router(products.router, prefix="/api/v1/products", tags=["Products"])
 
 @app.get("/check-bigquery")
 async def check_bigquery_connection():

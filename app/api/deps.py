@@ -3,28 +3,30 @@
 import time
 import os
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
+from fastapi.security import OAuth2PasswordBearer
+
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
 from app.config import settings
 
 # This helper scheme will extract the token from the "Authorization: Bearer <token>" header
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+security = HTTPBearer()
+# oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
-    """
-    Decodes and verifies the Supabase JWT.
-    Returns the token's payload if valid.
-    This is used for routes that any logged-in user can access.
-    """
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
+        # CHANGE 4: The token is now inside the credentials object
+        token = credentials.credentials
+        
+        # The rest of the logic remains the same
         payload = jwt.decode(
             token,
             settings.SUPABASE_JWT_SECRET,
@@ -36,23 +38,17 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     except JWTError:
         raise credentials_exception
 
+# --- Dependency for Admin-Only Routes (NO CHANGES NEEDED HERE) ---
 async def get_current_admin_user(current_user: dict = Depends(get_current_user)) -> dict:
-    """
-    A dependency for admin-only routes.
-    It first verifies the user is logged in, then checks for the 'Admin' role
-    and enforces a stricter session timeout for enhanced security.
-    """
-    # Your Edge Function adds roles to the 'app_metadata' claim
     roles = current_user.get("app_metadata", {}).get("roles", [])
 
     if "Admin" not in roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required for this resource."
+            detail="You do not have permission to access this resource."
         )
 
-    # Enforce a 1-hour session timeout for admins for security
-    MAX_ADMIN_SESSION_DURATION = 3600  # 1 hour in seconds
+    MAX_ADMIN_SESSION_DURATION = 3600
     issued_at_timestamp = current_user.get("iat")
 
     if (time.time() - issued_at_timestamp) > MAX_ADMIN_SESSION_DURATION:
