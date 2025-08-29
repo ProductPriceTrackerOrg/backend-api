@@ -11,14 +11,12 @@ from pydantic import BaseModel, Field, HttpUrl
 class Variant(BaseModel):
     """A product variant such as a specific size, color, or configuration"""
     variant_id: int
-    variant_title: str
+    title: str  # Using more consistent naming
     price: float
     original_price: Optional[float] = None
-    shop_id: int
-    shop_name: str
     is_available: bool
-    price_change_30d: Optional[float] = None
     discount: Optional[int] = None
+    price_change_30d: Optional[float] = None
 
 
 class Product(BaseModel):
@@ -28,8 +26,12 @@ class Product(BaseModel):
     brand: str
     category: str
     category_id: int
-    image: Optional[str] = None
+    image: Optional[str] = None  # Primary image
+    images: Optional[List[str]] = None  # All product images
     description: Optional[str] = None
+    retailer: Optional[str] = None
+    retailer_phone: Optional[str] = None
+    retailer_whatsapp: Optional[str] = None
     rating: Optional[float] = None
     review_count: Optional[int] = None
     variants: List[Variant]

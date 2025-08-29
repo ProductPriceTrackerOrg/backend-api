@@ -33,20 +33,17 @@ def get_supabase_client():
 
 @router.get("/{product_id}", response_model=ProductDetailsResponse)
 async def get_product_details(
-    product_id: int = Path(..., description="The ID of the product to retrieve"),
-    retailer_id: Optional[int] = Query(None, description="Filter by specific retailer"),
-    response: Response = None,
+    product_id: int = Path(..., description="The ID of the specific shop product to retrieve"),
+    # This dependency attempts to get a user if a token is provided, but doesn't fail if not.
     current_user: Optional[Dict] = Depends(get_current_user_optional),
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:
     """
-    Get detailed information about a product including all its variants.
-    
-    If authenticated, also returns whether the product is favorited by the user.
+    Get detailed information for a specific product listing from a single retailer,
+    including all its variants and their latest prices.
     """
+    # Cache key based on product ID
     cache_key = f"product:{product_id}"
-    if retailer_id:
-        cache_key += f":retailer:{retailer_id}"
     
     # Try to get from cache first if not authenticated (personalized results can't be cached)
     if not current_user:
@@ -55,96 +52,118 @@ async def get_product_details(
             return cached_data
     
     try:
-        # Construct the query
+        # This simpler query targets the exact product listing and gets the latest prices
         query = f"""
-        -- Get product with all variants
-        WITH ProductInfo AS (
-            SELECT
-                sp.shop_product_id as id,
-                sp.product_title_native as name,
-                sp.brand_native as brand,
-                c.category_name as category,
-                c.category_id,
-                v.variant_id,
-                v.variant_title,
-                s.shop_id,
-                s.shop_name as retailer,
-                fpp.current_price as price,
-                fpp.original_price,
-                fpp.is_available,
-                pi.image_url as image,
-                CASE
-                    WHEN fpp.original_price > 0 AND fpp.original_price > fpp.current_price
-                    THEN ROUND(((fpp.original_price - fpp.current_price) / fpp.original_price) * 100, 0)
-                    ELSE 0
-                END as discount
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
-            WHERE sp.shop_product_id = {product_id}
-            {f"AND s.shop_id = {retailer_id}" if retailer_id else ""}
-            -- Get the latest price info using QUALIFY
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY v.variant_id ORDER BY fpp.date_id DESC) = 1
+        WITH LatestPrices AS (
+            -- This CTE ensures we only get the most recent price for each variant.
+            SELECT variant_id, current_price, original_price, is_available, date_id
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY date_id DESC) = 1
         )
-        SELECT * FROM ProductInfo ORDER BY price ASC
+        SELECT
+          sp.shop_product_id as id,
+          sp.product_title_native as name,
+          sp.brand_native as brand,
+          '' as description,  -- Placeholder for description since description_native may not exist
+          c.category_name as category,
+          c.category_id,
+          v.variant_id,
+          v.variant_title as title,  -- Renamed to match our schema
+          s.shop_id,
+          s.shop_name as retailer,
+          s.contact_phone,
+          s.contact_whatsapp,
+          lp.current_price as price,
+          lp.original_price,
+          lp.is_available,
+          pi.image_url as image,
+          CASE
+            WHEN lp.original_price > 0 AND lp.original_price > lp.current_price
+            THEN ROUND(((lp.original_price - lp.current_price) / lp.original_price) * 100, 0)
+            ELSE 0
+          END as discount
+        FROM
+          `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
+        JOIN LatestPrices lp ON v.variant_id = lp.variant_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        -- Filtering directly by the specific shop_product_id
+        WHERE sp.shop_product_id = {product_id}
         """
-        
+
+        # Get all product images in a separate query
+        images_query = f"""
+        SELECT image_url
+        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+        WHERE shop_product_id = {product_id}
+        ORDER BY sort_order ASC
+        """
+
+        # Execute the main product query
         query_job = bq_client.query(query)
-        results = list(query_job.result())
-        
+        results = [dict(row) for row in query_job.result()]
+
+        # Execute the images query
+        images_job = bq_client.query(images_query)
+        images = [row['image_url'] for row in images_job.result()]
+
         if not results:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Product with ID {product_id} not found"
-            )
-        
-        # Extract the core product info (common across all variants)
+            raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
+
+        # Reshape the data into a nested structure
+        first_row = results[0]
         product_data = {
-            "id": results[0]["id"],
-            "name": results[0]["name"],
-            "brand": results[0]["brand"],
-            "category": results[0]["category"],
-            "category_id": results[0]["category_id"],
-            "image": results[0]["image"],
+            "id": first_row["id"],
+            "name": first_row["name"],
+            "brand": first_row["brand"],
+            "description": first_row["description"],
+            "category": first_row["category"],
+            "category_id": first_row["category_id"],
+            "image": first_row["image"],  # Primary image
+            "images": images,  # All images
+            "retailer": first_row["retailer"],
+            "retailer_phone": first_row["contact_phone"],
+            "retailer_whatsapp": first_row["contact_whatsapp"],
             "variants": [],
-            "is_favorited": False
+            "is_favorited": False  # Default to false for all users (anonymous or not)
         }
-        
-        # Add all variants
+
+        # Collect all variant IDs for favorites checking
+        all_variant_ids = []
         for row in results:
             variant = {
                 "variant_id": row["variant_id"],
-                "variant_title": row["variant_title"],
+                "title": row["title"],  # Now using the consistent field name
                 "price": row["price"],
                 "original_price": row["original_price"],
-                "shop_id": row["shop_id"],
-                "shop_name": row["retailer"],
                 "is_available": row["is_available"],
                 "discount": row["discount"]
             }
             product_data["variants"].append(variant)
-        
-        # Check if the user has favorited this product
+            all_variant_ids.append(row["variant_id"])
+
+        # Check favorites ONLY if the user is logged in
         if current_user:
             try:
                 supabase_client = get_supabase_client()
                 user_id = current_user.get("sub")
                 
-                # Query the UserFavorites table to check if this product is favorited
+                # Check if ANY of this product's variants are in the user's favorites list
                 response = supabase_client.table("UserFavorites") \
-                    .select("favorite_id") \
+                    .select("variant_id", count='exact') \
                     .eq("user_id", user_id) \
-                    .eq("variant_id", product_data["variants"][0]["variant_id"]) \
+                    .in_("variant_id", all_variant_ids) \
                     .execute()
                 
-                product_data["is_favorited"] = len(response.data) > 0
+                # Set favorited to True if any variant was found in favorites
+                if response.count is not None and response.count > 0:
+                    product_data["is_favorited"] = True
             except Exception as e:
                 print(f"Error checking favorites status: {e}")
                 # Continue without the favorites info if there's an error
-        
+
         result = {"product": product_data}
         
         # Cache the result for non-authenticated requests
@@ -156,7 +175,7 @@ async def get_product_details(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"An error occurred while fetching product details: {e}"
+            detail=f"An error occurred: {e}"
         )
 
 
