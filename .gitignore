@@ -60,10 +60,10 @@ __pycache__/
 .env.test
 .env.production
 
-# Docker
-.dockerignore
-Dockerfile
-docker-compose.yml
+# # Docker
+# .dockerignore
+# Dockerfile
+# docker-compose.yml
 
 # Temporary files
 tmp/

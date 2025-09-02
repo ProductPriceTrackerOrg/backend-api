@@ -1,0 +1,62 @@
+name: Docker CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Create mock GCP credentials file for testing
+        run: |
+          echo '{
+            "type": "service_account",
+            "project_id": "mock-project",
+            "private_key_id": "mock-key-id",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nmock-key\n-----END PRIVATE KEY-----\n",
+            "client_email": "mock@example.com",
+            "client_id": "12345",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/mock"
+          }' > gcp-credentials.json
+
+      - name: Create env file
+        run: |
+          echo "SUPABASE_URL=https://example.supabase.co" > .env
+          echo "SUPABASE_KEY=mock-key" >> .env
+          echo "SUPABASE_JWT_SECRET=mock-secret" >> .env
+          echo "GCP_PROJECT_ID=mock-project" >> .env
+          echo "BIGQUERY_DATASET_ID=mock-dataset" >> .env
+          echo "DATA_SOURCE=bigquery" >> .env
+
+      - name: Build and test Docker image
+        run: |
+          docker-compose build
+          docker-compose up -d
+
+          # Wait for service to start
+          echo "Waiting for API to start..."
+          sleep 10
+
+          # Run health check
+          HEALTH_STATUS=$(docker-compose exec -T api curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health || echo "failed")
+          echo "Health status: $HEALTH_STATUS"
+
+          # Stop services
+          docker-compose down
+
+          if [ "$HEALTH_STATUS" != "200" ]; then
+            echo "Health check failed"
+            exit 1
+          fi
