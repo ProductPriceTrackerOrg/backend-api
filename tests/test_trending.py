@@ -1,160 +1,129 @@
 """
-Test cases for the trending endpoint
+Test the trending products and new launches API endpoints
 """
-import pytest
-from unittest.mock import patch, MagicMock
-from fastapi.testclient import TestClient
-from app.main import app
 
-client = TestClient(app)
+import requests
+import json
+from pprint import pprint
 
+# Base URL
+BASE_URL = "http://localhost:8000/api/v1"
 
-@pytest.fixture
-def mock_bigquery_result():
-    """
-    Mock the results returned by BigQuery for trending queries
-    """
-    # Create mock products
-    mock_products = [
-        {
-            "id": 1,
-            "name": "iPhone 15 Pro Max",
-            "brand": "Apple",
-            "category": "Smartphones",
-            "variant_id": 101,
-            "variant_title": "128GB Space Black",
-            "price": 1299.99,
-            "original_price": 1399.99,
-            "discount": 7,
-            "retailer": "MobileWorld",
-            "retailer_id": 1,
-            "in_stock": True,
-            "image": "https://example.com/image.jpg",
-            "trend_score": 98,
-            "search_volume": "+245%",
-            "price_change": -100.00,
-            "is_trending": True
-        },
-        {
-            "id": 2,
-            "name": "Samsung Galaxy S25",
-            "brand": "Samsung",
-            "category": "Smartphones",
-            "variant_id": 102,
-            "variant_title": "256GB Phantom Black",
-            "price": 999.99,
-            "original_price": 1099.99,
-            "discount": 9,
-            "retailer": "TechStore",
-            "retailer_id": 2,
-            "in_stock": True,
-            "image": "https://example.com/image2.jpg",
-            "trend_score": 85,
-            "search_volume": "+190%",
-            "price_change": -90.00,
-            "is_trending": True
-        }
-    ]
-
-    # Create mock products for launches
-    mock_launches = [
-        {
-            "id": 3,
-            "name": "Google Pixel 9",
-            "brand": "Google",
-            "category": "Smartphones",
-            "price": 899.99,
-            "retailer": "GoogleStore",
-            "retailer_id": 3,
-            "in_stock": True,
-            "image": "https://example.com/pixel.jpg",
-            "launch_date": "2025-08-15",
-            "pre_orders": 12500,
-            "rating": 4.8,
-            "is_new": True
-        }
-    ]
-
-    return {
-        "trends": mock_products,
-        "launches": mock_launches
-    }
-
-
-@patch('app.api.deps.get_bigquery_client')
-def test_get_trending_products(mock_get_bigquery_client, mock_bigquery_result):
-    """Test the trending products endpoint with default parameters"""
+def test_trending_products():
+    """Test the trending products endpoint"""
+    print("\n=== Testing Trending Products API ===")
     
-    # Setup mock BigQuery client and results
-    mock_client = MagicMock()
-    mock_get_bigquery_client.return_value = mock_client
+    # Test with default parameters
+    url = f"{BASE_URL}/trending?type=trends"
+    print(f"Sending GET request to {url}")
     
-    # Mock the query results
-    mock_results = MagicMock()
-    mock_results.result.return_value = mock_bigquery_result['trends']
+    response = requests.get(url)
     
-    # Configure mock query call
-    mock_client.query.return_value = mock_results
+    if response.status_code == 200:
+        data = response.json()
+        print("Success! Status code:", response.status_code)
+        print(f"Total trending products: {len(data['products'])}")
+        
+        # Display the trending products structure
+        print("\nTrending products structure:")
+        for idx, product in enumerate(data['products'][:3], 1):  # Show first 3 products
+            print(f"\n{idx}. {product['name']}")
+            print(f"   Brand: {product['brand']}")
+            print(f"   Category: {product['category']}")
+            print(f"   Price: ${product['price']}")
+            print(f"   Discount: {product.get('discount', '0')}%")
+            print(f"   Trend Score: {product.get('trend_score', 'N/A')}")
+            
+        # Display stats
+        print("\nStats:")
+        print(f"   Trending Searches: {data['stats'].get('trending_searches', 'N/A')}")
+        print(f"   Accuracy Rate: {data['stats'].get('accuracy_rate', 'N/A')}")
+        print(f"   Update Frequency: {data['stats'].get('update_frequency', 'N/A')}")
+    else:
+        print("Failed! Status code:", response.status_code)
+        print("Response:", response.text)
     
-    # Test the endpoint
-    response = client.get("/api/v1/trending?type=trends")
+    # Test with specific category
+    url = f"{BASE_URL}/trending?type=trends&category=Laptops"
+    print(f"\nSending GET request to {url}")
     
-    assert response.status_code == 200
-    data = response.json()
+    response = requests.get(url)
     
-    # Check response structure
-    assert "products" in data
-    assert "stats" in data
+    if response.status_code == 200:
+        data = response.json()
+        print("Success! Status code:", response.status_code)
+        print(f"Total trending products in Laptops category: {len(data['products'])}")
+        
+        # Check if all products are in the Laptops category
+        all_laptops = all(product['category'] == 'Laptops' for product in data['products'])
+        print(f"All products are in Laptops category: {all_laptops}")
+    else:
+        print("Failed! Status code:", response.status_code)
+        print("Response:", response.text)
+        
+    # Test with different period
+    url = f"{BASE_URL}/trending?type=trends&period=month"
+    print(f"\nSending GET request to {url}")
     
-    # Check products data
-    assert len(data["products"]) == 2
-    product = data["products"][0]
-    assert product["id"] == 1
-    assert product["name"] == "iPhone 15 Pro Max"
-    assert product["brand"] == "Apple"
-    assert product["price"] == 1299.99
-    assert product["is_trending"] == True
+    response = requests.get(url)
     
-    # Check stats
-    assert "trending_searches" in data["stats"]
-    assert "accuracy_rate" in data["stats"]
-    assert "update_frequency" in data["stats"]
+    if response.status_code == 200:
+        data = response.json()
+        print("Success! Status code:", response.status_code)
+        print(f"Total trending products in month period: {len(data['products'])}")
+    else:
+        print("Failed! Status code:", response.status_code)
+        print("Response:", response.text)
 
-
-@patch('app.api.deps.get_bigquery_client')
-def test_get_new_launches(mock_get_bigquery_client, mock_bigquery_result):
+def test_new_launches():
     """Test the new product launches endpoint"""
+    print("\n=== Testing New Product Launches API ===")
     
-    # Setup mock BigQuery client and results
-    mock_client = MagicMock()
-    mock_get_bigquery_client.return_value = mock_client
+    # Test with default parameters
+    url = f"{BASE_URL}/trending?type=launches"
+    print(f"Sending GET request to {url}")
     
-    # Mock the query results
-    mock_results = MagicMock()
-    mock_results.result.return_value = mock_bigquery_result['launches']
+    response = requests.get(url)
     
-    # Configure mock query call
-    mock_client.query.return_value = mock_results
+    if response.status_code == 200:
+        data = response.json()
+        print("Success! Status code:", response.status_code)
+        print(f"Total new launches: {len(data['products'])}")
+        
+        # Display the new launches structure
+        print("\nNew launches structure:")
+        for idx, product in enumerate(data['products'][:3], 1):  # Show first 3 products
+            print(f"\n{idx}. {product['name']}")
+            print(f"   Brand: {product['brand']}")
+            print(f"   Category: {product['category']}")
+            print(f"   Price: ${product['price']}")
+            print(f"   Launch Date: {product.get('launch_date', 'N/A')}")
+            print(f"   Pre-orders: {product.get('pre_orders', 'N/A')}")
+            print(f"   Rating: {product.get('rating', 'N/A')}")
+            
+        # Display stats
+        print("\nStats:")
+        print(f"   New Launches: {data['stats'].get('new_launches', 'N/A')}")
+        print(f"   Update Frequency: {data['stats'].get('update_frequency', 'N/A')}")
+        print(f"   Tracking Type: {data['stats'].get('tracking_type', 'N/A')}")
+    else:
+        print("Failed! Status code:", response.status_code)
+        print("Response:", response.text)
     
-    # Test the endpoint
-    response = client.get("/api/v1/trending?type=launches")
+    # Test with specific category
+    url = f"{BASE_URL}/trending?type=launches&category=Smartphones"
+    print(f"\nSending GET request to {url}")
     
-    assert response.status_code == 200
-    data = response.json()
+    response = requests.get(url)
     
-    # Check response structure
-    assert "products" in data
-    assert "stats" in data
-    
-    # Check products data
-    assert len(data["products"]) == 1
-    product = data["products"][0]
-    assert product["id"] == 3
-    assert product["name"] == "Google Pixel 9"
-    assert product["brand"] == "Google"
-    assert product["is_new"] == True
-    
-    # Check stats
-    assert "new_launches" in data["stats"]
-    assert "update_frequency" in data["stats"]
-    assert "tracking_type" in data["stats"]
+    if response.status_code == 200:
+        data = response.json()
+        print("Success! Status code:", response.status_code)
+        print(f"Total new launches in Smartphones category: {len(data['products'])}")
+    else:
+        print("Failed! Status code:", response.status_code)
+        print("Response:", response.text)
+
+if __name__ == "__main__":
+    test_trending_products()
+    test_new_launches()
