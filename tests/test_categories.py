@@ -21,7 +21,7 @@ def test_improved_categories():
     
     if response.status_code == 200:
         data = response.json()
-        print("✅ Success! Status code:", response.status_code)
+        print("Success! Status code:", response.status_code)
         print(f"Total categories: {data['total_categories']}")
         print(f"Total products: {data['total_products']}")
         
@@ -41,7 +41,7 @@ def test_improved_categories():
                     break
                 print(f"     {i}. {sub['name']} (ID: {sub['category_id']}, Products: {sub['product_count']})")
     else:
-        print("❌ Failed! Status code:", response.status_code)
+        print("Failed! Status code:", response.status_code)
         print("Response:", response.text)
     
     # Test without subcategories
@@ -52,7 +52,7 @@ def test_improved_categories():
     
     if response.status_code == 200:
         data = response.json()
-        print("✅ Success! Status code:", response.status_code)
+        print("Success! Status code:", response.status_code)
         print(f"Total categories: {data['total_categories']}")
         print(f"Total products: {data['total_products']}")
         
@@ -60,7 +60,7 @@ def test_improved_categories():
         has_empty_subcats = all(len(cat.get('subcategories', [])) == 0 for cat in data['categories'])
         print(f"All categories have empty subcategories lists: {has_empty_subcats}")
     else:
-        print("❌ Failed! Status code:", response.status_code)
+        print("Failed! Status code:", response.status_code)
         print("Response:", response.text)
 
 if __name__ == "__main__":
