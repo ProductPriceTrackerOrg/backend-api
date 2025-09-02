@@ -42,19 +42,20 @@ jobs:
 
       - name: Build and test Docker image
         run: |
-          docker-compose build
-          docker-compose up -d
+          # Use 'docker compose' instead of 'docker-compose'
+          docker compose build
+          docker compose up -d
 
           # Wait for service to start
           echo "Waiting for API to start..."
           sleep 10
 
           # Run health check
-          HEALTH_STATUS=$(docker-compose exec -T api curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health || echo "failed")
+          HEALTH_STATUS=$(docker compose exec -T api curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health || echo "failed")
           echo "Health status: $HEALTH_STATUS"
 
           # Stop services
-          docker-compose down
+          docker compose down
 
           if [ "$HEALTH_STATUS" != "200" ]; then
             echo "Health check failed"
