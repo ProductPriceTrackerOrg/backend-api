@@ -3,6 +3,7 @@
 ## Important
 
 `have to implement the personalized recomendation and search paet in the home page`
+`have to implement the correct compare api endpoint for product page`
 
 ## Overview
 
