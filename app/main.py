@@ -65,6 +65,9 @@ app.include_router(home.router, prefix="/api/v1/home", tags=["Home"])
 # Include the product routes
 from app.api.v1 import products
 app.include_router(products.router, prefix="/api/v1/products", tags=["Products"])
+# Include the categories routes
+from app.api.v1 import categories
+app.include_router(categories.router, prefix="/api/v1/categories", tags=["Categories"])
 # Include debug routes for troubleshooting
 from app.api.v1 import debug
 app.include_router(debug.router, prefix="/api/v1/debug", tags=["Debug"])
