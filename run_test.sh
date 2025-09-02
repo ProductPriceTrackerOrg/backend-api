@@ -13,3 +13,4 @@ echo "Server is running. Running the test script..."
 
 # Run the test script
 python tests/test_categories.py
+python tests/test_trending.py

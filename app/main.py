@@ -71,6 +71,9 @@ app.include_router(categories.router, prefix="/api/v1/categories", tags=["Catego
 # Include debug routes for troubleshooting
 from app.api.v1 import debug
 app.include_router(debug.router, prefix="/api/v1/debug", tags=["Debug"])
+# Include the trending routes
+from app.api.v1 import trending
+app.include_router(trending.router, prefix="/api/v1/trending", tags=["Trending"])
 
 @app.get("/health")
 async def health_check():
