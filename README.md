@@ -40,7 +40,7 @@ price-pulse-backend/
 │   │       ├── users.py              # User management endpoints
 │   │       ├── products.py           # Product-related endpoints
 │   │       ├── search.py             # Search & filtering endpoints
-│   │       ├── categories.py         # Categories & trending endpoints
+│   │       ├── categories.py         # Categories and child categories
 │   │       ├── analytics.py          # Analytics & forecasting endpoints
 │   │       ├── notifications.py     # Notification endpoints
 │   │       ├── admin.py              # Admin dashboard endpoints
