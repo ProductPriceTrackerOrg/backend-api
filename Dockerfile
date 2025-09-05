@@ -24,8 +24,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy project files
 COPY . .
 
-# Make entrypoint script executable
-RUN chmod +x /app/docker-entrypoint.sh
+# Convert line endings and make entrypoint script executable
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoint.sh
 
 # Expose port
 EXPOSE 8000
