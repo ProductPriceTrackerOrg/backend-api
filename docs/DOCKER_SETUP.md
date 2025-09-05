@@ -29,14 +29,14 @@ This guide explains how to set up and run the PricePulse backend using Docker an
    docker-compose up --build
    ```
 
-   This command builds the Docker image and starts the service. The API will be available at http://localhost:8000.
+   This command builds the Docker image and starts the service. The API will be available at http://localhost:9000.
 
 3. **Access the API documentation:**
 
    Open your browser and navigate to:
 
-   - Swagger UI: http://localhost:8000/docs
-   - ReDoc: http://localhost:8000/redoc
+   - Swagger UI: http://localhost:9000/docs
+   - ReDoc: http://localhost:9000/redoc
 
 ## Running in Background
 

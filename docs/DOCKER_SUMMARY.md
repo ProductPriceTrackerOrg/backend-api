@@ -19,7 +19,7 @@ This document summarizes the Docker implementation for the PricePulse API backen
 3. **docker-compose.yml**
 
    - Production configuration
-   - Maps port 8000 to host
+   - Maps port 9000 to host
    - Mounts GCP credentials
    - Configures environment variables
    - Includes healthcheck
