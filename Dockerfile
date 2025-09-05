@@ -24,8 +24,11 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy project files
 COPY . .
 
-# Make entrypoint script executable
-RUN chmod +x /app/docker-entrypoint.sh
+# Make sure the entrypoint script exists and is executable
+COPY docker-entrypoint.sh /app/
+RUN chmod +x /app/docker-entrypoint.sh && \
+    ls -la /app/docker-entrypoint.sh && \
+    echo "Entrypoint script is ready"
 
 # Expose port
 EXPOSE 8000

@@ -45,6 +45,7 @@ htmlcov/
 # Docker specific
 Dockerfile
 .dockerignore
+!docker-entrypoint.sh  # Make sure this file is included
 
 # Other
 README.md
