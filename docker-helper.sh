@@ -49,8 +49,8 @@ case "$1" in
         echo "Starting PricePulse API services in detached mode..."
         docker-compose up -d
         echo "Services are now running in the background"
-        echo "API is available at http://localhost:8000"
-        echo "API Documentation: http://localhost:8000/docs"
+        echo "API is available at http://localhost:9000"
+        echo "API Documentation: http://localhost:9000/docs"
         ;;
     down)
         echo "Stopping PricePulse API services..."

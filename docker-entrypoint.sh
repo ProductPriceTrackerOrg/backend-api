@@ -4,10 +4,13 @@
 set -e
 
 # Check if GCP credentials file exists
-if [ ! -f "/app/gcp-credentials.json" ]; then
+if [ ! -f "/app/gcp-credentials.json" ] && [ "${SKIP_GCP_CHECK}" != "true" ]; then
     echo "ERROR: GCP credentials file not found!"
     echo "Make sure to mount gcp-credentials.json as a volume in docker-compose.yml"
+    echo "Or set SKIP_GCP_CHECK=true to bypass this check (for development only)"
     exit 1
+elif [ ! -f "/app/gcp-credentials.json" ]; then
+    echo "WARNING: GCP credentials file not found, but continuing as SKIP_GCP_CHECK is set"
 fi
 
 # Print startup information

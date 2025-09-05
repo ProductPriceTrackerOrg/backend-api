@@ -50,7 +50,7 @@ This document provides detailed instructions for setting up, running, and mainta
 
 5. Verify the API is running:
    ```bash
-   curl http://localhost:8000/health
+   curl http://localhost:9000/health
    ```
 
 ## Docker Environments
@@ -151,7 +151,7 @@ docker-compose exec api python -m pytest tests/test_file.py -v --pdb
 
 ### Monitoring in Production
 
-- Health check endpoint: `http://localhost:8000/health`
+- Health check endpoint: `http://localhost:9000/health`
 - View logs: `docker-compose logs -f`
 - Container status: `docker-compose ps`
 
@@ -168,7 +168,7 @@ docker-compose exec api python -m pytest tests/test_file.py -v --pdb
 2. **Container fails to start**
 
    - Check logs: `docker-compose logs api`
-   - Verify port 8000 is not already in use
+   - Verify port 9000 is not already in use
    - Check for Python dependency issues
 
 3. **API returns 500 errors**
