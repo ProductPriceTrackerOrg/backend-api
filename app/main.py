@@ -3,7 +3,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import users, home,newarrivals
+from app.api.v1 import users, home, newarrivals
 from app.config import settings
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPICallError
@@ -85,6 +85,10 @@ app.include_router(trending.router, prefix="/api/v1/trending", tags=["Trending"]
 from app.api.v1 import newarrivals
 
 app.include_router(newarrivals.router, prefix="/api/v1", tags=["new-arrivals"])
+# Include the top deals routes
+from app.api.v1 import topdeals
+
+app.include_router(topdeals.router, prefix="/api/v1", tags=["top-deals"])
 
 
 @app.get("/health")
