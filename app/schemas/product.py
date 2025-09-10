@@ -23,7 +23,7 @@ class Product(BaseModel):
     """A canonical product with all its variants"""
     id: int
     name: str
-    brand: str
+    brand: Optional[str]
     category: Optional[str] = "Uncategorized"
     category_id: Optional[int] = 0
     image: Optional[str] = None  # Primary image
