@@ -84,11 +84,11 @@ app.include_router(trending.router, prefix="/api/v1/trending", tags=["Trending"]
 # Include the new arrivals routes
 from app.api.v1 import newarrivals
 
-app.include_router(newarrivals.router, prefix="/api/v1", tags=["new-arrivals"])
+app.include_router(newarrivals.router, prefix="/api/v1/new-arrivals", tags=["new-arrivals"])
 # Include the top deals routes
 from app.api.v1 import topdeals
 
-app.include_router(topdeals.router, prefix="/api/v1", tags=["top-deals"])
+app.include_router(topdeals.router, prefix="/api/v1/top-deals", tags=["top-deals"])
 
 
 @app.get("/health")
