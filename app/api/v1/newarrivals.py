@@ -31,9 +31,9 @@ def get_new_arrivals(
     # Build WHERE clauses with proper filtering
     where_clauses = []
 
-    # Handle category filtering
-    if query.category and query.category.lower() not in ["null", "none", "", "all"]:
-        where_clauses.append(f"LOWER(c.category_name) LIKE LOWER('%{query.category}%')")
+    # Note: Category filtering is temporarily disabled as DimCategory table is not available
+    # if query.category and query.category.lower() not in ["null", "none", "", "all"]:
+    #    where_clauses.append(f"LOWER(c.category_name) LIKE LOWER('%{query.category}%')")
 
     # Handle retailer filtering
     if query.retailer and query.retailer.lower() not in ["null", "none", "", "all"]:
@@ -128,7 +128,7 @@ def get_new_arrivals(
         sp.shop_product_id,
         sp.product_title_native as product_title,
         COALESCE(sp.brand_native, 'Unknown Brand') as brand,
-        c.category_name,
+        'Not Available' as category_name, -- Placeholder since DimCategory is not available
         COALESCE(v.variant_title, sp.product_title_native) as variant_title,
         s.shop_name,
         fp.current_price,
@@ -150,8 +150,6 @@ def get_new_arrivals(
         ON fp.variant_id = v.variant_id
     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
         ON v.shop_product_id = sp.shop_product_id
-    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
-        ON sp.predicted_master_category_id = c.category_id
     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
         ON sp.shop_id = s.shop_id
     LEFT JOIN (
@@ -319,14 +317,12 @@ def get_new_arrivals(
             COUNT(DISTINCT v.variant_id) as total_new_arrivals,
             ROUND(AVG(fp.current_price), 2) as average_price,
             SUM(CASE WHEN fp.is_available = TRUE THEN 1 ELSE 0 END) as in_stock_count,
-            COUNT(DISTINCT c.category_name) as category_count
+            1 as category_count -- Placeholder since DimCategory is not available
         FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
             ON v.shop_product_id = sp.shop_product_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
-            ON sp.predicted_master_category_id = c.category_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
         WHERE {stats_where_sql}
@@ -525,7 +521,7 @@ def check_database_stock_distribution(
             s.shop_name,
             fp.current_price,
             fp.is_available,
-            c.category_name
+            'Not Available' as category_name
         FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
@@ -533,8 +529,6 @@ def check_database_stock_distribution(
             ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
-            ON sp.predicted_master_category_id = c.category_id
         WHERE fp.date_id = (
             SELECT MAX(date_id) 
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
@@ -554,7 +548,7 @@ def check_database_stock_distribution(
             s.shop_name,
             fp.current_price,
             fp.is_available,
-            c.category_name
+            'Not Available' as category_name
         FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
@@ -562,8 +556,6 @@ def check_database_stock_distribution(
             ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
-            ON sp.predicted_master_category_id = c.category_id
         WHERE fp.date_id = (
             SELECT MAX(date_id) 
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
@@ -605,9 +597,9 @@ def debug_new_arrivals(bq_client: bigquery.Client = Depends(get_bigquery_client)
             "DimVariant",
             "DimShopProduct",
             "FactProductPrice",
-            "DimCategory",
             "DimShop",
             "DimProductImage",
+            "DimDate",
         ]
 
         results = {}
@@ -627,7 +619,7 @@ def debug_new_arrivals(bq_client: bigquery.Client = Depends(get_bigquery_client)
             s.shop_name,
             fp.current_price,
             fp.is_available,
-            c.category_name,
+            'Not Available' as category_name,
             CASE 
                 WHEN fp.is_available = TRUE THEN 'In Stock' 
                 WHEN fp.is_available = FALSE THEN 'Out of Stock'
@@ -640,8 +632,6 @@ def debug_new_arrivals(bq_client: bigquery.Client = Depends(get_bigquery_client)
             ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
-            ON sp.predicted_master_category_id = c.category_id
         WHERE fp.date_id = (
             SELECT MAX(date_id) 
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
