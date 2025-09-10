@@ -24,8 +24,8 @@ class Product(BaseModel):
     id: int
     name: str
     brand: str
-    category: str
-    category_id: int
+    category: Optional[str] = "Uncategorized"
+    category_id: Optional[int] = 0
     image: Optional[str] = None  # Primary image
     images: Optional[List[str]] = None  # All product images
     description: Optional[str] = None
