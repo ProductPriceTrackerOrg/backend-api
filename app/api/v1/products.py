@@ -64,9 +64,9 @@ async def get_product_details(
           sp.shop_product_id as id,
           sp.product_title_native as name,
           sp.brand_native as brand,
-          '' as description,  -- Placeholder for description since description_native may not exist
-          c.category_name as category,
-          c.category_id,
+          sp.description_native as description,  -- Use actual description field
+          c.category_name as category, -- This will be NULL if no category is assigned
+          c.category_id,                -- This will be NULL if no category is assigned
           v.variant_id,
           v.variant_title as title,  -- Renamed to match our schema
           s.shop_id,
@@ -86,8 +86,9 @@ async def get_product_details(
           `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
-        JOIN LatestPrices lp ON v.variant_id = lp.variant_id
+        -- Changed to LEFT JOIN to handle products without a category since predicted_master_category_id is not filled yet
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
+        LEFT JOIN LatestPrices lp ON v.variant_id = lp.variant_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
         -- Filtering directly by the specific shop_product_id
         WHERE sp.shop_product_id = {product_id}
@@ -118,9 +119,9 @@ async def get_product_details(
             "id": first_row["id"],
             "name": first_row["name"],
             "brand": first_row["brand"],
-            "description": first_row["description"],
-            "category": first_row["category"],
-            "category_id": first_row["category_id"],
+            "description": first_row["description"] or "",  # Ensure description is never None
+            "category": first_row["category"] or "Uncategorized",  # Provide default for NULL category
+            "category_id": first_row["category_id"] or 0,  # Provide default for NULL category_id
             "image": first_row["image"],  # Primary image
             "images": images,  # All images
             "retailer": first_row["retailer"],
