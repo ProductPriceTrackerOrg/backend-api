@@ -2,7 +2,8 @@ version: "3.8"
 
 services:
   api:
-    build: .
+    # build: .
+    image: yugan430/pricepulse-backend-api:latest
     container_name: pricepulse-api-dev
     ports:
       - "9000:8000"
@@ -15,7 +16,8 @@ services:
       - DATA_SOURCE=${DATA_SOURCE}
       - RELOAD_FLAG=--reload
     volumes:
-      - ./:/app
+      - ./app:/app/app
+      - ./tests:/app/tests
       - ./gcp-credentials.json:/app/gcp-credentials.json:ro
     restart: unless-stopped
     healthcheck:
