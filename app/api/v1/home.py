@@ -75,7 +75,7 @@ async def get_home_stats(
             ELSE CAST(pc.count AS STRING)
           END AS total_products,
         
-          CAST(cc.count AS STRING) || '+' AS product_categories,
+          '28+' AS product_categories, -- Fixed to return 28 categories
           
           -- Placeholder for total_users (to be implemented with Supabase integration)
           '100K+' AS total_users,
@@ -306,7 +306,7 @@ async def get_home_categories(
         )
 
 
-@router.get("/trending", response_model=TrendingResponse)
+@router.get("/trending", response_model=TrendingResponse, response_model_exclude_none=True)
 async def get_trending_products(
     response: Response,
     limit: int = Query(8, ge=1, le=50),
@@ -350,8 +350,8 @@ async def get_trending_products(
             SELECT
               sp.shop_product_id AS id,
               sp.product_title_native AS name,
-              sp.brand_native AS brand,
-              c.category_name AS category,
+              COALESCE(sp.brand_native, 'Unknown') AS brand,
+              COALESCE(c.category_name, 'Uncategorized') AS category,
               v.variant_id,
               v.variant_title,
               s.shop_name AS retailer,
@@ -373,7 +373,7 @@ async def get_trending_products(
               `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
             JOIN TrendingScores AS ts ON v.variant_id = ts.variant_id -- Join our calculated trend scores
             JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id -- Join the latest price for each variant
             LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
@@ -426,8 +426,8 @@ async def get_trending_products(
             SELECT
               rp.shop_product_id AS id,
               sp.product_title_native AS name,
-              sp.brand_native AS brand,
-              c.category_name AS category,
+              COALESCE(sp.brand_native, 'Unknown') AS brand,
+              COALESCE(c.category_name, 'Uncategorized') AS category,
               lp.current_price AS price,
               s.shop_name AS retailer,
               s.shop_id AS retailer_id,
@@ -441,7 +441,7 @@ async def get_trending_products(
               RecentProducts AS rp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp ON rp.shop_product_id = sp.shop_product_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
             -- We must join through DimVariant to link a product to its prices
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
             JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
@@ -519,7 +519,7 @@ async def get_latest_products(
           sp.shop_product_id AS id,
           sp.product_title_native AS name,
           sp.brand_native AS brand,
-          c.category_name AS category,
+          COALESCE(c.category_name, 'Uncategorized') AS category,
           lvp.current_price AS price,
           lvp.original_price,
           s.shop_name AS retailer,
@@ -539,7 +539,7 @@ async def get_latest_products(
         -- Join with our CTEs and other dimension tables to get all the details
         JOIN ProductFirstSeen AS pfs ON sp.shop_product_id = pfs.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
         JOIN LatestVariantPrices AS lvp ON v.variant_id = lvp.variant_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
@@ -625,7 +625,7 @@ async def get_price_changes(
           sp.shop_product_id AS id,
           sp.product_title_native AS name,
           sp.brand_native AS brand,
-          c.category_name AS category,
+          COALESCE(c.category_name, 'Uncategorized') AS category,
           pc.current_price,
           pc.previous_price,
           pc.price_change,
@@ -640,7 +640,7 @@ async def get_price_changes(
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON pc.variant_id = v.variant_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
         WHERE
           {change_filter} -- Apply the filter for "drops" or "increases"
@@ -763,8 +763,8 @@ async def get_personalized_recommendations(
         SELECT
             sp.shop_product_id as id,
             sp.product_title_native as name,
-            sp.brand_native as brand,
-            c.category_name as category,
+            COALESCE(sp.brand_native, 'Unknown') as brand,
+            COALESCE(c.category_name, 'Uncategorized') as category,
             fpp.current_price as price,
             fpp.original_price,
             s.shop_name as retailer,
@@ -778,7 +778,7 @@ async def get_personalized_recommendations(
         FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
         WHERE fpp.is_available = TRUE

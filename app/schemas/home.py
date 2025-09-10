@@ -34,8 +34,8 @@ class CategoriesResponse(BaseModel):
 class TrendingProduct(BaseModel):
     id: int
     name: str
-    brand: str
-    category: str
+    brand: Optional[str] = None
+    category: Optional[str] = None
     variant_id: Optional[int] = None
     variant_title: Optional[str] = None
     price: float
@@ -52,9 +52,11 @@ class TrendingProduct(BaseModel):
 
 
 class TrendingStats(BaseModel):
-    trending_searches: str
-    accuracy_rate: str
-    update_frequency: str
+    trending_searches: Optional[str] = None
+    accuracy_rate: Optional[str] = None
+    update_frequency: Optional[str] = None
+    new_launches: Optional[str] = None
+    tracking_type: Optional[str] = None
 
 
 class TrendingResponse(BaseModel):
@@ -66,8 +68,8 @@ class TrendingResponse(BaseModel):
 class NewLaunchProduct(BaseModel):
     id: int
     name: str
-    brand: str
-    category: str
+    brand: Optional[str]
+    category: Optional[str] = "Uncategorized"
     price: float
     retailer: str
     retailer_id: int
@@ -94,8 +96,8 @@ class NewLaunchResponse(BaseModel):
 class LatestProduct(BaseModel):
     id: int
     name: str
-    brand: str
-    category: str
+    brand: Optional[str]
+    category: Optional[str] = "Uncategorized"
     price: float
     original_price: Optional[float] = None
     retailer: str
@@ -116,10 +118,10 @@ class LatestProductsResponse(BaseModel):
 class PriceChange(BaseModel):
     id: int
     name: str
-    brand: str
-    category: str
+    brand: Optional[str]
+    category: Optional[str] = "Uncategorized"
     current_price: float
-    previous_price: float
+    previous_price: Optional[float] = 0.0
     price_change: float
     percentage_change: float
     retailer: str
@@ -137,7 +139,7 @@ class PriceChangeResponse(BaseModel):
 class Retailer(BaseModel):
     shop_id: int
     name: str
-    logo: str
+    logo: Optional[str]
     website_url: Optional[str] = None
     product_count: int
     avg_rating: float
@@ -160,8 +162,8 @@ class SearchSuggestions(BaseModel):
 class RecommendedProduct(BaseModel):
     id: int
     name: str
-    brand: str
-    category: str
+    brand: Optional[str]
+    category: Optional[str] = "Uncategorized"
     price: float
     original_price: Optional[float] = None
     retailer: str
