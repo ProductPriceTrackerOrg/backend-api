@@ -7,7 +7,7 @@ class Product(BaseModel):
     id: int
     name: str
     brand: Optional[str] = None
-    category: Optional[str] = None
+    category_name: Optional[str] = "Uncategorized"
     price: float
     original_price: Optional[float] = None
     discount: Optional[int] = None

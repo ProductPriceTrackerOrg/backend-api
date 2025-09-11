@@ -64,7 +64,10 @@ def get_deals(
 
     # Handle category filtering
     if query.category and query.category.lower() not in ["null", "none", "", "all"]:
-        where_clauses.append(f"LOWER(c.category_name) LIKE LOWER('%{query.category}%')")
+        if query.category.lower() == "uncategorized":
+            where_clauses.append("c.category_name IS NULL OR LOWER(c.category_name) = 'uncategorized'")
+        else:
+            where_clauses.append(f"LOWER(COALESCE(c.category_name, 'Uncategorized')) LIKE LOWER('%{query.category}%')")
 
     # Handle retailer filtering
     if query.retailer and query.retailer.lower() not in ["null", "none", "", "all"]:
@@ -136,7 +139,7 @@ def get_deals(
         sp.shop_product_id as product_id,
         sp.product_title_native as product_title,
         sp.brand_native as brand,
-        c.category_name,
+        COALESCE(c.category_name, 'Uncategorized') as category_name,
         COALESCE(v.variant_title, sp.product_title_native) as variant_title,
         s.shop_name,
         fp.current_price,
@@ -158,7 +161,7 @@ def get_deals(
         ON fp.variant_id = v.variant_id
     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
         ON v.shop_product_id = sp.shop_product_id
-    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
+    LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
         ON sp.predicted_master_category_id = c.category_id
     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
         ON sp.shop_id = s.shop_id
@@ -170,6 +173,7 @@ def get_deals(
         FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
     ) pi ON sp.shop_product_id = pi.shop_product_id AND pi.rn = 1
     WHERE {where_sql}
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY sp.shop_product_id ORDER BY ((fp.original_price - fp.current_price) / fp.original_price * 100) DESC, fp.current_price ASC) = 1
     ORDER BY {order_sql}
     LIMIT {query.limit} OFFSET {offset}
     """
@@ -236,17 +240,18 @@ def get_deals(
                 v.variant_id,
                 fp.current_price,
                 fp.original_price,
-                c.category_name,
+                COALESCE(c.category_name, 'Uncategorized') as category_name,
                 s.shop_name,
                 fp.is_available,
                 ROUND(((fp.original_price - fp.current_price) / fp.original_price * 100), 2) as discount_percentage,
-                ROUND((fp.original_price - fp.current_price), 2) as discount_amount
+                ROUND((fp.original_price - fp.current_price), 2) as discount_amount,
+                sp.shop_product_id
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
                 ON fp.variant_id = v.variant_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
                 ON v.shop_product_id = sp.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
                 ON sp.predicted_master_category_id = c.category_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
                 ON sp.shop_id = s.shop_id
@@ -258,6 +263,8 @@ def get_deals(
                     FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
                     WHERE variant_id = v.variant_id
                 )
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY sp.shop_product_id ORDER BY 
+                ROUND(((fp.original_price - fp.current_price) / fp.original_price * 100), 2) DESC) = 1
         )
         SELECT
             COUNT(DISTINCT variant_id) as total_deals,
@@ -440,13 +447,14 @@ def get_deals_analytics_endpoint(
         WITH deal_data AS (
             SELECT
                 c.category_name,
-                ROUND(((fp.original_price - fp.current_price) / fp.original_price * 100), 2) as discount_percentage
+                ROUND(((fp.original_price - fp.current_price) / fp.original_price * 100), 2) as discount_percentage,
+                sp.shop_product_id
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
                 ON fp.variant_id = v.variant_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
                 ON v.shop_product_id = sp.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
                 ON sp.predicted_master_category_id = c.category_id
             WHERE fp.original_price > fp.current_price
                 AND fp.original_price IS NOT NULL
@@ -456,14 +464,15 @@ def get_deals_analytics_endpoint(
                     FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
                     WHERE variant_id = v.variant_id
                 )
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY sp.shop_product_id ORDER BY ((fp.original_price - fp.current_price) / fp.original_price * 100) DESC) = 1
         )
         SELECT
-            category_name,
+            COALESCE(category_name, 'Uncategorized') as category_name,
             COUNT(*) as deal_count,
             ROUND(AVG(discount_percentage), 2) as average_discount,
             ROUND(MAX(discount_percentage), 2) as highest_discount
         FROM deal_data
-        GROUP BY category_name
+        GROUP BY COALESCE(category_name, 'Uncategorized')
         ORDER BY deal_count DESC
         LIMIT 10
         """
@@ -484,13 +493,14 @@ def get_deals_analytics_endpoint(
         WITH deal_data AS (
             SELECT
                 s.shop_name,
-                ROUND(((fp.original_price - fp.current_price) / fp.original_price * 100), 2) as discount_percentage
+                ROUND(((fp.original_price - fp.current_price) / fp.original_price * 100), 2) as discount_percentage,
+                sp.shop_product_id
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
                 ON fp.variant_id = v.variant_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
                 ON v.shop_product_id = sp.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s
                 ON sp.shop_id = s.shop_id
             WHERE fp.original_price > fp.current_price
                 AND fp.original_price IS NOT NULL
@@ -500,6 +510,7 @@ def get_deals_analytics_endpoint(
                     FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
                     WHERE variant_id = v.variant_id
                 )
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY sp.shop_product_id ORDER BY ((fp.original_price - fp.current_price) / fp.original_price * 100) DESC) = 1
         )
         SELECT
             shop_name,

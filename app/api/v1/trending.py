@@ -69,7 +69,7 @@ async def get_trending_products(
               sp.shop_product_id AS id,
               sp.product_title_native AS name,
               sp.brand_native AS brand,
-              c.category_name AS category,
+              COALESCE(c.category_name, 'Uncategorized') AS category,
               v.variant_id,
               v.variant_title,
               s.shop_name AS retailer,
@@ -91,13 +91,13 @@ async def get_trending_products(
               `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
             JOIN TrendingScores AS ts ON v.variant_id = ts.variant_id -- Join our calculated trend scores
             JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id -- Join the latest price for each variant
             LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
             WHERE
               lp.is_available = TRUE -- Only show trending products that are in stock
-              {f"AND c.category_name = '{category}'" if category else ""}
+              {f"AND (c.category_name = '{category}' OR (c.category_name IS NULL AND '{category}' = 'Uncategorized'))" if category else ""}
             ORDER BY
               {f"ts.trend_score DESC" if sort == "trend_score" else ""}
               {f"ABS(price_change) DESC" if sort == "price_change" else ""}
@@ -148,7 +148,7 @@ async def get_trending_products(
               rp.shop_product_id AS id,
               sp.product_title_native AS name,
               sp.brand_native AS brand,
-              c.category_name AS category,
+              COALESCE(c.category_name, 'Uncategorized') AS category,
               lp.current_price AS price,
               s.shop_name AS retailer,
               s.shop_id AS retailer_id,
@@ -162,14 +162,14 @@ async def get_trending_products(
               RecentProducts AS rp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp ON rp.shop_product_id = sp.shop_product_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
             -- We must join through DimVariant to link a product to its prices
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
             JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
             LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
             WHERE
               lp.is_available = TRUE -- Only show new launches that are in stock
-              {f"AND c.category_name = '{category}'" if category else ""}
+              {f"AND (c.category_name = '{category}' OR (c.category_name IS NULL AND '{category}' = 'Uncategorized'))" if category else ""}
             ORDER BY
               rp.first_seen_date DESC
             LIMIT {limit}

@@ -29,6 +29,7 @@ class Product(BaseModel):
     image: Optional[str] = None  # Primary image
     images: Optional[List[str]] = None  # All product images
     description: Optional[str] = None
+    product_url: Optional[str] = None  # URL to the product page
     retailer: Optional[str] = None
     retailer_phone: Optional[str] = None
     retailer_whatsapp: Optional[str] = None

@@ -8,7 +8,7 @@ class DealResponse(BaseModel):
     product_id: int = Field(..., description="Main product identifier (same as shop_product_id)")
     product_title: str = Field(..., description="Product name/title")
     brand: Optional[str] = Field(None, description="Product brand")
-    category_name: str = Field(..., description="Product category")
+    category_name: Optional[str] = Field("Uncategorized", description="Product category")
     variant_title: Optional[str] = Field(None, description="Variant specifications")
     shop_name: str = Field(..., description="Retailer/shop name")
     current_price: float = Field(..., description="Current discounted price")

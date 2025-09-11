@@ -59,12 +59,23 @@ async def get_product_details(
             SELECT variant_id, current_price, original_price, is_available, date_id
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
             QUALIFY ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY date_id DESC) = 1
+        ),
+        -- Add a CTE to identify the highest price variant
+        MaxPriceVariant AS (
+            SELECT 
+                v.variant_id,
+                v.shop_product_id,
+                ROW_NUMBER() OVER(PARTITION BY v.shop_product_id ORDER BY lp.current_price DESC) AS price_rank
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v
+            JOIN LatestPrices lp ON v.variant_id = lp.variant_id
+            WHERE v.shop_product_id = {product_id}
         )
         SELECT
           sp.shop_product_id as id,
           sp.product_title_native as name,
           sp.brand_native as brand,
           sp.description_native as description,  -- Use actual description field
+          sp.product_url,               -- URL to the product page
           c.category_name as category, -- This will be NULL if no category is assigned
           c.category_id,                -- This will be NULL if no category is assigned
           v.variant_id,
@@ -81,7 +92,8 @@ async def get_product_details(
             WHEN lp.original_price > 0 AND lp.original_price > lp.current_price
             THEN ROUND(((lp.original_price - lp.current_price) / lp.original_price) * 100, 0)
             ELSE 0
-          END as discount
+          END as discount,
+          mpv.price_rank
         FROM
           `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
@@ -90,6 +102,7 @@ async def get_product_details(
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
         LEFT JOIN LatestPrices lp ON v.variant_id = lp.variant_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        JOIN MaxPriceVariant mpv ON v.variant_id = mpv.variant_id
         -- Filtering directly by the specific shop_product_id
         WHERE sp.shop_product_id = {product_id}
         """
@@ -113,34 +126,50 @@ async def get_product_details(
         if not results:
             raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
 
-        # Reshape the data into a nested structure
-        first_row = results[0]
+        # Find the highest price variant (rank = 1)
+        max_price_variant = None
+        for row in results:
+            if row["price_rank"] == 1:
+                max_price_variant = row
+                break
+        
+        # If no max price variant found, use the first row
+        if max_price_variant is None:
+            max_price_variant = results[0]
+        
+        # Reshape the data into a nested structure using the highest price variant
         product_data = {
-            "id": first_row["id"],
-            "name": first_row["name"],
-            "brand": first_row["brand"],
-            "description": first_row["description"] or "",  # Ensure description is never None
-            "category": first_row["category"] or "Uncategorized",  # Provide default for NULL category
-            "category_id": first_row["category_id"] or 0,  # Provide default for NULL category_id
-            "image": first_row["image"],  # Primary image
+            "id": max_price_variant["id"],
+            "name": max_price_variant["name"],
+            "brand": max_price_variant["brand"],
+            "description": max_price_variant["description"] or "",  # Ensure description is never None
+            "product_url": max_price_variant["product_url"],  # URL to the product page
+            "category": max_price_variant["category"] or "Uncategorized",  # Provide default for NULL category
+            "category_id": max_price_variant["category_id"] or 0,  # Provide default for NULL category_id
+            "image": max_price_variant["image"],  # Primary image
             "images": images,  # All images
-            "retailer": first_row["retailer"],
-            "retailer_phone": first_row["contact_phone"],
-            "retailer_whatsapp": first_row["contact_whatsapp"],
+            "retailer": max_price_variant["retailer"],
+            "retailer_phone": max_price_variant["contact_phone"],
+            "retailer_whatsapp": max_price_variant["contact_whatsapp"],
             "variants": [],
-            "is_favorited": False  # Default to false for all users (anonymous or not)
+            "is_favorited": False,  # Default to false for all users (anonymous or not)
+            "max_price_variant_id": max_price_variant["variant_id"]  # Add this for reference
         }
 
-        # Collect all variant IDs for favorites checking
+        # Collect all variant IDs for favorites checking and sort variants by price (highest first)
         all_variant_ids = []
-        for row in results:
+        # First create a sorted list of variants by price_rank
+        sorted_results = sorted(results, key=lambda x: x["price_rank"])
+        
+        for row in sorted_results:
             variant = {
                 "variant_id": row["variant_id"],
-                "title": row["title"],  # Now using the consistent field name
+                "title": row["title"],
                 "price": row["price"],
                 "original_price": row["original_price"],
                 "is_available": row["is_available"],
-                "discount": row["discount"]
+                "discount": row["discount"],
+                "is_highest_price": row["price_rank"] == 1  # Mark the highest price variant
             }
             product_data["variants"].append(variant)
             all_variant_ids.append(row["variant_id"])
@@ -165,6 +194,9 @@ async def get_product_details(
                 print(f"Error checking favorites status: {e}")
                 # Continue without the favorites info if there's an error
 
+        # Log which variant is being used as primary
+        print(f"Using highest price variant {max_price_variant['variant_id']} for product {product_id}")
+        
         result = {"product": product_data}
         
         # Cache the result for non-authenticated requests
@@ -204,8 +236,24 @@ async def get_price_history(
     
     try:
         query = f"""
-        -- Price history with changes
-        WITH PriceHistory AS (
+        -- First identify the highest price variant for this product
+        WITH MaxPriceVariant AS (
+            SELECT 
+                v.variant_id
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
+            WHERE sp.shop_product_id = {product_id}
+            {f"AND s.shop_id = {retailer_id}" if retailer_id else ""}
+            -- Get the latest price for each variant
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY v.variant_id ORDER BY fpp.date_id DESC) = 1
+            -- Select the variant with the highest price
+            ORDER BY fpp.current_price DESC
+            LIMIT 1
+        ),
+        -- Price history with changes for the selected variant only
+        PriceHistory AS (
             SELECT
                 d.full_date as date,
                 v.variant_id,
@@ -216,6 +264,7 @@ async def get_price_history(
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
+            JOIN MaxPriceVariant mpv ON v.variant_id = mpv.variant_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON fpp.date_id = d.date_id
             WHERE sp.shop_product_id = {product_id}
@@ -248,11 +297,17 @@ async def get_price_history(
                 detail=f"Price history not found for product ID {product_id}"
             )
         
+        # Get the variant ID for better logging
+        variant_id = results[0]["variant_id"] if results and "variant_id" in results[0] else "unknown"
+        
         # Calculate statistics
         prices = [row["price"] for row in results]
         current_price = prices[-1] if prices else 0
         min_price = min(prices) if prices else 0
         max_price = max(prices) if prices else 0
+        
+        # Log that we're using the highest price variant
+        print(f"Using price history for product {product_id}, highest price variant {variant_id}")
         
         # Prepare the response
         price_history_data = []
@@ -279,7 +334,8 @@ async def get_price_history(
                 "max_price": max_price,
                 "price_drop_percent": round(((max_price - current_price) / max_price * 100), 2) if max_price > 0 else 0,
                 "total_days": len(results),
-                "price_changes": sum(1 for row in results if row["change"] is not None and row["change"] != 0)
+                "price_changes": sum(1 for row in results if row["change"] is not None and row["change"] != 0),
+                "variant_id": variant_id  # Include variant_id in statistics
             }
         }
         
