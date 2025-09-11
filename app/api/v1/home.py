@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from typing import Dict, List, Optional, Any
 from google.cloud import bigquery
 import supabase
+import logging
+import datetime
 from app.config import settings
 from app.api.deps import get_current_user, get_current_admin_user, get_bigquery_client
 from app.services.cache_service import cache_service
@@ -17,6 +19,9 @@ from app.schemas.home import (
     RecommendationsResponse
 )
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 @router.get("/stats", response_model=HomeStats)
@@ -572,39 +577,37 @@ async def get_latest_products(
 
 @router.get("/price-changes", response_model=PriceChangeResponse)
 async def get_price_changes(
-    response: Response,
     limit: int = Query(8, ge=1, le=50),
     type: str = Query("drops", regex="^(drops|increases)$"),
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:
     """
     Get products with the most significant price drops or increases from the last available day.
-    This implementation uses a single, efficient query.
     """
     try:
-        # The dynamic part of the query changes based on the 'type' parameter.
+        # The dynamic filter for drops or increases
         change_filter = "pc.percentage_change < 0" if type == "drops" else "pc.percentage_change > 0"
 
         # This single, robust query handles all the logic in the database.
         query = f"""
         WITH
-          -- Step 1: Use a window function to get each variant's price and the price from the previous day in one row.
           DailyPriceComparison AS (
             SELECT
               fpp.variant_id,
               dd.full_date AS current_date,
               fpp.current_price AS current_price,
-              -- LAG() function looks back one row within the partition to get the previous price.
               LAG(fpp.current_price, 1) OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date) AS previous_price
-            FROM
-              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
-            JOIN
-              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON fpp.date_id = dd.date_id
-            -- This ensures we only consider the LATEST price if there are multiple on the same day.
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id, dd.full_date ORDER BY fpp.price_fact_id DESC) = 1
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON fpp.date_id = dd.date_id
+          ),
+          
+          -- FIX: First, find the most recent date that actually had price changes.
+          LatestChangeDate AS (
+            SELECT MAX(current_date) AS max_date
+            FROM DailyPriceComparison
+            WHERE previous_price IS NOT NULL AND current_price != previous_price
           ),
 
-          -- Step 2: Calculate the changes and filter for only the most recent day's activity.
           PriceChanges AS (
             SELECT
               variant_id,
@@ -613,14 +616,13 @@ async def get_price_changes(
               (current_price - previous_price) AS price_change,
               ROUND(((current_price - previous_price) / NULLIF(previous_price, 0)) * 100, 2) AS percentage_change,
               current_date AS change_date
-            FROM
-              DailyPriceComparison
-            WHERE
-              previous_price IS NOT NULL AND current_price != previous_price
-              AND current_date = (SELECT MAX(full_date) FROM `pricepulse_analytics.DimDate`)
+            FROM DailyPriceComparison
+            -- FIX: Now, filter for that specific date.
+            WHERE current_date = (SELECT max_date FROM LatestChangeDate)
+              AND previous_price IS NOT NULL 
+              AND current_price != previous_price
           )
 
-        -- Step 3: Join the calculated changes with the product dimension data for the final output.
         SELECT
           sp.shop_product_id AS id,
           sp.product_title_native AS name,
@@ -633,28 +635,38 @@ async def get_price_changes(
           s.shop_name AS retailer,
           s.shop_id AS retailer_id,
           pi.image_url AS image,
-          pc.change_date,
-          TRUE AS in_stock -- Assuming changes are only tracked for available items
-        FROM
-          PriceChanges pc
+          CAST(pc.change_date AS STRING) AS change_date,
+          TRUE AS in_stock
+        FROM PriceChanges pc
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON pc.variant_id = v.variant_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
         WHERE
-          {change_filter} -- Apply the filter for "drops" or "increases"
+          {change_filter}
         ORDER BY
-          ABS(pc.percentage_change) DESC -- Order by the magnitude of the change
+          ABS(pc.percentage_change) DESC
         LIMIT {limit}
         """
 
         query_job = bq_client.query(query)
         results = [dict(row) for row in query_job.result()]
 
+        # Ensure proper data format for all fields
+        for row in results:
+            # Make sure change_date is a string
+            if isinstance(row.get("change_date"), (datetime.date, datetime.datetime)):
+                row["change_date"] = row["change_date"].isoformat()
+            
+            # Ensure in_stock is boolean
+            if "in_stock" not in row:
+                row["in_stock"] = True
+
         return {"price_changes": results}
 
     except Exception as e:
+        logger.error(f"Error fetching price changes: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred while querying BigQuery: {e}"
