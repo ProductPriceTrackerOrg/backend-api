@@ -21,4 +21,5 @@ echo "BigQuery Dataset: ${BIGQUERY_DATASET_ID:-not set}"
 
 # Start the application
 echo "Starting uvicorn server..."
-exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} ${RELOAD_FLAG}
+# exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} ${RELOAD_FLAG}
+exec gunicorn -w ${WORKER_COUNT:-1} -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8000} app.main:app
