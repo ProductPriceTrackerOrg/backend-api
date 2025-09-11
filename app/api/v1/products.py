@@ -75,6 +75,7 @@ async def get_product_details(
           sp.product_title_native as name,
           sp.brand_native as brand,
           sp.description_native as description,  -- Use actual description field
+          sp.product_url,               -- URL to the product page
           c.category_name as category, -- This will be NULL if no category is assigned
           c.category_id,                -- This will be NULL if no category is assigned
           v.variant_id,
@@ -142,6 +143,7 @@ async def get_product_details(
             "name": max_price_variant["name"],
             "brand": max_price_variant["brand"],
             "description": max_price_variant["description"] or "",  # Ensure description is never None
+            "product_url": max_price_variant["product_url"],  # URL to the product page
             "category": max_price_variant["category"] or "Uncategorized",  # Provide default for NULL category
             "category_id": max_price_variant["category_id"] or 0,  # Provide default for NULL category_id
             "image": max_price_variant["image"],  # Primary image

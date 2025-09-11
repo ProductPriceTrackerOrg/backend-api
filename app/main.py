@@ -89,6 +89,10 @@ app.include_router(newarrivals.router, prefix="/api/v1/new-arrivals", tags=["new
 from app.api.v1 import topdeals
 
 app.include_router(topdeals.router, prefix="/api/v1/top-deals", tags=["top-deals"])
+# Include the favorites routes
+from app.api.v1 import favorites
+
+app.include_router(favorites.router, prefix="/api/v1/favorites", tags=["Favorites"])
 
 
 @app.get("/health")
