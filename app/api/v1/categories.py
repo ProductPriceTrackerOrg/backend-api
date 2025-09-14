@@ -164,7 +164,7 @@ async def get_category_products(
     category_id: int = Path(..., description="The ID of the category to retrieve products for"),
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Number of products per page"),
-    sort_by: str = Query("price_asc", description="Sorting method: price_asc, price_desc, name_asc"),
+    sort_by: str = Query("price_desc", description="Sorting method: price_asc, price_desc, name_asc"),
     brand: Optional[str] = Query(None, description="Filter by brand name"),
     min_price: Optional[float] = Query(None, description="Minimum price filter"),
     max_price: Optional[float] = Query(None, description="Maximum price filter"),

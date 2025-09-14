@@ -390,7 +390,7 @@ def get_query_params(
     minPrice: Optional[float] = Query(None, description="Minimum price filter", ge=0),
     maxPrice: Optional[float] = Query(None, description="Maximum price filter", ge=0),
     sortBy: Optional[str] = Query(
-        "newest",
+        "price_high",
         description="Sort order: newest, oldest, price_low, price_high, name_az, name_za",
     ),
     inStockOnly: Optional[bool] = Query(

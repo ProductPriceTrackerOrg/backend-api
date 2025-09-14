@@ -218,7 +218,7 @@ async def search_products(
         ORDER BY 
           is_direct_match DESC,
           relevance_score DESC,
-          price ASC
+          price DESC
         LIMIT @limit
         OFFSET @offset
         """
