@@ -48,21 +48,21 @@ class PriceRange(BaseModel):
 
 class FilterOptions(BaseModel):
     brands: List[Brand]
-    retailers: List[Retailer]
-    price_ranges: List[PriceRange]
+    retailers: Optional[List[Retailer]] = []
+    price_ranges: Optional[List[PriceRange]] = []
 
 
 class ProductInCategory(BaseModel):
     id: int
     name: str
-    brand: str
+    brand: Optional[str] = None
     price: float
+    retailer: str
     original_price: Optional[float] = None
     discount: Optional[int] = None
-    retailer: str
-    retailer_id: int
-    in_stock: bool
-    image: str
+    retailer_id: Optional[int] = None
+    in_stock: Optional[bool] = True
+    image: Optional[str] = None
     rating: Optional[float] = None
     popularity_score: Optional[int] = None
 
