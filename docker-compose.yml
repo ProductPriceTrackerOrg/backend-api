@@ -3,7 +3,7 @@ version: "3.8"
 services:
   api:
     build: .
-    container_name: pricepulse-api
+    container_name: pricepulse-api-2
     ports:
       - "9000:8000"
     environment:

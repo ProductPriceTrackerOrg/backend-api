@@ -349,6 +349,15 @@ async def get_trending_products(
                 -- The QUALIFY clause filters the results of a window function.
                 -- It's like a HAVING clause for window functions.
                 QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date DESC) = 1
+              ),
+              
+              -- Get the primary image for each product (lowest sort_order available)
+              ProductImages AS (
+                SELECT 
+                  shop_product_id,
+                  image_url
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+                QUALIFY ROW_NUMBER() OVER(PARTITION BY shop_product_id ORDER BY sort_order ASC) = 1
               )
 
             -- Step 3: Join the trending scores and latest prices with product details.
@@ -381,7 +390,7 @@ async def get_trending_products(
             LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
             JOIN TrendingScores AS ts ON v.variant_id = ts.variant_id -- Join our calculated trend scores
             JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id -- Join the latest price for each variant
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            LEFT JOIN ProductImages AS pi ON sp.shop_product_id = pi.shop_product_id
             WHERE
               lp.is_available = TRUE -- Only show trending products that are in stock
             ORDER BY
@@ -425,6 +434,15 @@ async def get_trending_products(
                 FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp
                 JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS dd ON fpp.date_id = dd.date_id
                 QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date DESC) = 1
+              ),
+              
+              -- Get the primary image for each product (lowest sort_order available)
+              ProductImages AS (
+                SELECT 
+                  shop_product_id,
+                  image_url
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+                QUALIFY ROW_NUMBER() OVER(PARTITION BY shop_product_id ORDER BY sort_order ASC) = 1
               )
 
             -- Step 3: Join the recent products with their details and latest price.
@@ -450,7 +468,7 @@ async def get_trending_products(
             -- We must join through DimVariant to link a product to its prices
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
             JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            LEFT JOIN ProductImages AS pi ON sp.shop_product_id = pi.shop_product_id
             WHERE
               lp.is_available = TRUE -- Only show new launches that are in stock
             ORDER BY
@@ -517,6 +535,15 @@ async def get_latest_products(
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON fpp.date_id = dd.date_id
             -- This QUALIFY clause selects only the row with the most recent date for each variant_id.
             QUALIFY ROW_NUMBER() OVER(PARTITION BY fpp.variant_id ORDER BY dd.full_date DESC) = 1
+          ),
+          
+          -- Get the primary image for each product (lowest sort_order available)
+          ProductImages AS (
+            SELECT 
+              shop_product_id,
+              image_url
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY shop_product_id ORDER BY sort_order ASC) = 1
           )
 
         -- Step 3: Combine the data, ensuring one row per product, ordered by when it was first seen.
@@ -547,7 +574,7 @@ async def get_latest_products(
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
         JOIN LatestVariantPrices AS lvp ON v.variant_id = lvp.variant_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        LEFT JOIN ProductImages AS pi ON sp.shop_product_id = pi.shop_product_id
         WHERE
           lvp.is_available = TRUE -- Only show products that are currently in stock
         -- This final QUALIFY ensures we only get one row per product (shop_product_id),
@@ -607,6 +634,15 @@ async def get_price_changes(
             FROM DailyPriceComparison
             WHERE previous_price IS NOT NULL AND current_price != previous_price
           ),
+          
+          -- Get the primary image for each product (lowest sort_order available)
+          ProductImages AS (
+            SELECT 
+              shop_product_id,
+              image_url
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY shop_product_id ORDER BY sort_order ASC) = 1
+          ),
 
           PriceChanges AS (
             SELECT
@@ -642,7 +678,7 @@ async def get_price_changes(
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        LEFT JOIN ProductImages pi ON sp.shop_product_id = pi.shop_product_id
         WHERE
           {change_filter}
         ORDER BY

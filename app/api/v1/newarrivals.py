@@ -61,10 +61,10 @@ def get_new_arrivals(
         """
         where_clauses.append(time_filter_sql)
         logger.info(
-            f"✅ TIME FILTER: Showing items from last {days} days (timeRange={query.timeRange})"
+            f"TIME FILTER: Showing items from last {days} days (timeRange={query.timeRange})"
         )
     else:
-        logger.info("✅ NO TIME FILTER: Showing items from all time periods")
+        logger.info("NO TIME FILTER: Showing items from all time periods")
 
     # CORRECTED LOGIC: Handle stock filtering based on boolean value
     logger.info(f"=== STOCK FILTER DEBUG ===")
@@ -75,18 +75,18 @@ def get_new_arrivals(
         # When True: Show ONLY in-stock products (is_available = TRUE)
         where_clauses.append("fp.is_available = TRUE")
         logger.info(
-            "✅ STOCK FILTER: inStockOnly=True - showing ONLY in-stock products (is_available=TRUE)"
+            "STOCK FILTER: inStockOnly=True - showing ONLY in-stock products (is_available=TRUE)"
         )
     elif query.inStockOnly is False:
         # When False: Show ONLY out-of-stock products (is_available = FALSE)
         where_clauses.append("fp.is_available = FALSE")
         logger.info(
-            "✅ STOCK FILTER: inStockOnly=False - showing ONLY out-of-stock products (is_available=FALSE)"
+            "STOCK FILTER: inStockOnly=False - showing ONLY out-of-stock products (is_available=FALSE)"
         )
     else:
         # When None: Show ALL products (no stock filter applied)
         logger.info(
-            "✅ NO STOCK FILTER: inStockOnly=None - showing ALL products (both in-stock and out-of-stock)"
+            "NO STOCK FILTER: inStockOnly=None - showing ALL products (both in-stock and out-of-stock)"
         )
 
     # Build final WHERE clause
@@ -390,7 +390,7 @@ def get_query_params(
     minPrice: Optional[float] = Query(None, description="Minimum price filter", ge=0),
     maxPrice: Optional[float] = Query(None, description="Maximum price filter", ge=0),
     sortBy: Optional[str] = Query(
-        "newest",
+        "price_high",
         description="Sort order: newest, oldest, price_low, price_high, name_az, name_za",
     ),
     inStockOnly: Optional[bool] = Query(
