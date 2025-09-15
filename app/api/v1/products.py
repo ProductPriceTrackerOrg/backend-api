@@ -252,15 +252,14 @@ async def get_price_history(
             ORDER BY fpp.current_price DESC
             LIMIT 1
         ),
-        -- Price history with changes for the selected variant only
-        PriceHistory AS (
+        -- Get the unique dates first to handle possible multiple prices on the same day
+        DailyPrices AS (
             SELECT
-                d.full_date as date,
+                d.full_date,
                 v.variant_id,
-                fpp.current_price as price,
-                LAG(fpp.current_price) OVER(PARTITION BY v.variant_id ORDER BY d.full_date) as previous_price,
-                MIN(fpp.current_price) OVER(PARTITION BY v.variant_id) as min_price,
-                MAX(fpp.current_price) OVER(PARTITION BY v.variant_id) as max_price
+                fpp.current_price,
+                -- Select the latest entry for each date (in case of multiple entries per day)
+                ROW_NUMBER() OVER(PARTITION BY v.variant_id, d.full_date ORDER BY fpp.price_fact_id DESC) AS row_num
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
@@ -270,7 +269,20 @@ async def get_price_history(
             WHERE sp.shop_product_id = {product_id}
             {f"AND s.shop_id = {retailer_id}" if retailer_id else ""}
             AND d.full_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-            ORDER BY d.full_date DESC
+        ),
+        
+        -- Price history with changes for the selected variant only (one price per day)
+        PriceHistory AS (
+            SELECT
+                full_date as date,
+                variant_id,
+                current_price as price,
+                LAG(current_price) OVER(PARTITION BY variant_id ORDER BY full_date) as previous_price,
+                MIN(current_price) OVER(PARTITION BY variant_id) as min_price,
+                MAX(current_price) OVER(PARTITION BY variant_id) as max_price
+            FROM DailyPrices
+            WHERE row_num = 1 -- Only take the latest entry for each date
+            ORDER BY full_date DESC
         )
         
         SELECT
@@ -288,6 +300,35 @@ async def get_price_history(
         ORDER BY date ASC
         """
         
+        # Get the variant ID first for better logging
+        variant_query = f"""
+        SELECT variant_id
+        FROM MaxPriceVariant
+        LIMIT 1
+        """
+        
+        variant_job = bq_client.query(f"""
+        WITH MaxPriceVariant AS (
+            SELECT 
+                v.variant_id
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
+            WHERE sp.shop_product_id = {product_id}
+            {f"AND s.shop_id = {retailer_id}" if retailer_id else ""}
+            -- Get the latest price for each variant
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY v.variant_id ORDER BY fpp.date_id DESC) = 1
+            -- Select the variant with the highest price
+            ORDER BY fpp.current_price DESC
+            LIMIT 1
+        )
+        SELECT variant_id FROM MaxPriceVariant
+        """)
+        variant_result = list(variant_job.result())
+        variant_id = variant_result[0]["variant_id"] if variant_result else "unknown"
+        
+        # Run the main price history query
         query_job = bq_client.query(query)
         results = list(query_job.result())
         
@@ -296,9 +337,6 @@ async def get_price_history(
                 status_code=404,
                 detail=f"Price history not found for product ID {product_id}"
             )
-        
-        # Get the variant ID for better logging
-        variant_id = results[0]["variant_id"] if results and "variant_id" in results[0] else "unknown"
         
         # Calculate statistics
         prices = [row["price"] for row in results]

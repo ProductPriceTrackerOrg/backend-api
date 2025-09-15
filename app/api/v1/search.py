@@ -135,7 +135,16 @@ async def search_products(
             QUALIFY ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY date_id DESC) = 1
           ),
           
-          -- Step 4: Get all products in the same match groups (including products that didn't match the search directly)
+          -- Step 4: Get the primary image for each product (lowest sort_order available)
+          ProductImages AS (
+            SELECT 
+              shop_product_id,
+              image_url
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY shop_product_id ORDER BY sort_order ASC) = 1
+          ),
+          
+          -- Step 5: Get all products in the same match groups (including products that didn't match the search directly)
           GroupedProducts AS (
             SELECT
               sp.shop_product_id,
@@ -172,14 +181,14 @@ async def search_products(
             LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
             LEFT JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi 
-              ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            -- Join with ProductImages to get the image with the lowest sort_order
+            LEFT JOIN ProductImages pi ON sp.shop_product_id = pi.shop_product_id
             -- Left join with MatchingProducts to determine if this is a direct match
             LEFT JOIN MatchingProducts mp ON sp.shop_product_id = mp.shop_product_id
             WHERE lp.is_available = TRUE
           ),
           
-          -- Step 5: Get the best product (lowest price) for each match group
+          -- Step 6: Get the best product (lowest price) for each match group
           BestProducts AS (
             SELECT
               shop_product_id,
@@ -204,7 +213,7 @@ async def search_products(
             QUALIFY price_rank = 1
           ),
           
-          -- Step 5: Count total results for pagination
+          -- Step 7: Count total results for pagination
           TotalCount AS (
             SELECT COUNT(*) AS total_count FROM BestProducts
           )

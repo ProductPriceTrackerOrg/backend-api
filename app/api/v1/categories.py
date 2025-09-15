@@ -221,6 +221,14 @@ async def get_category_products(
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
             QUALIFY ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY date_id DESC) = 1
           ),
+          -- Get the primary image for each product (lowest sort_order available)
+          ProductImages AS (
+            SELECT 
+              shop_product_id,
+              image_url
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+            QUALIFY ROW_NUMBER() OVER(PARTITION BY shop_product_id ORDER BY sort_order ASC) = 1
+          ),
           ProductsInScope AS (
             SELECT
               sp.shop_product_id, sp.product_title_native, sp.brand_native,
@@ -235,8 +243,8 @@ async def get_category_products(
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
             LEFT JOIN LatestPrices lp ON v.variant_id = lp.variant_id -- Use LEFT JOIN to not lose products without price
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi 
-              ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            -- Join with ProductImages to get the image with the lowest sort_order
+            LEFT JOIN ProductImages pi ON sp.shop_product_id = pi.shop_product_id
             WHERE sp.predicted_master_category_id IN (SELECT category_id FROM CategoryAndDescendants)
             AND {filter_sql}
           ),
