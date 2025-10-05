@@ -3,7 +3,7 @@ version: "3.8"
 services:
   api:
     build: .
-    container_name: pricepulse-api-dev
+    container_name: pricepulse-api-dev-11
     ports:
       - "9000:8000"
     environment:
@@ -14,7 +14,9 @@ services:
       - GCP_PROJECT_ID=${GCP_PROJECT_ID}
       - BIGQUERY_DATASET_ID=${BIGQUERY_DATASET_ID}
       - DATA_SOURCE=${DATA_SOURCE}
+      - RELOAD_FLAG=--reload
     volumes:
+      - ./app:/app/app
       - ./gcp-credentials.json:/app/gcp-credentials.json:ro
     restart: unless-stopped
     healthcheck:

@@ -4,13 +4,13 @@ from typing import Dict, Any
 from datetime import datetime, timedelta
 
 # Base URL for testing
-BASE_URL = "http://localhost:8000/api/v1"
+BASE_URL = "http://localhost:9000/api/v1"
 
 
 def check_server_connectivity():
     """Check if the server is running before running tests"""
     try:
-        response = requests.get(f"{BASE_URL}/new-arrivals/debug", timeout=5)
+        response = requests.get(f"{BASE_URL}/new-arrivals/new-arrivals/debug", timeout=5)
         return response.status_code == 200
     except requests.exceptions.ConnectionError:
         return False
@@ -25,7 +25,7 @@ class TestNewArrivals:
         """First check if database actually has out-of-stock items"""
         print(f"\n=== DATABASE STOCK DISTRIBUTION CHECK ===")
 
-        response = requests.get(f"{BASE_URL}/new-arrivals/check-database-stock")
+        response = requests.get(f"{BASE_URL}/new-arrivals/new-arrivals/check-database-stock")
         assert response.status_code == 200
         data = response.json()
 
@@ -77,7 +77,7 @@ class TestNewArrivals:
         has_out_of_stock = self.test_database_has_out_of_stock_items()
 
         print(f"\n=== inStockOnly=FALSE Test (CORRECTED LOGIC) ===")
-        response = requests.get(f"{BASE_URL}/new-arrivals?inStockOnly=false&limit=30")
+        response = requests.get(f"{BASE_URL}/new-arrivals/new-arrivals?inStockOnly=false&limit=30")
         assert response.status_code == 200
         data = response.json()
         assert "items" in data
@@ -127,7 +127,7 @@ class TestNewArrivals:
 
     def test_stock_filtering_true_only_instock(self):
         """Test inStockOnly=true - should ONLY return items where is_available=true"""
-        response = requests.get(f"{BASE_URL}/new-arrivals?inStockOnly=true&limit=20")
+        response = requests.get(f"{BASE_URL}/new-arrivals/new-arrivals?inStockOnly=true&limit=20")
         assert response.status_code == 200
         data = response.json()
         assert "items" in data
@@ -167,7 +167,7 @@ class TestNewArrivals:
     def test_stock_filtering_null_shows_all(self):
         """Test inStockOnly=null/None - should show ALL items (both in-stock and out-of-stock)"""
         response = requests.get(
-            f"{BASE_URL}/new-arrivals?limit=30"
+            f"{BASE_URL}/new-arrivals/new-arrivals?limit=30"
         )  # No inStockOnly parameter = null
         assert response.status_code == 200
         data = response.json()
@@ -212,7 +212,7 @@ class TestNewArrivals:
 
             try:
                 response = requests.get(
-                    f"{BASE_URL}/new-arrivals?timeRange={time_range}&limit=10",
+                    f"{BASE_URL}/new-arrivals/new-arrivals?timeRange={time_range}&limit=10",
                     timeout=10,
                 )
 
@@ -281,7 +281,7 @@ class TestNewArrivals:
 
             try:
                 response = requests.get(
-                    f"{BASE_URL}/new-arrivals?timeRange={time_range}&limit=20"
+                    f"{BASE_URL}/new-arrivals/new-arrivals?timeRange={time_range}&limit=20"
                 )
                 assert (
                     response.status_code == 200
@@ -373,7 +373,7 @@ class TestNewArrivals:
         for time_range in valid_ranges:
             print(f"\nTesting valid timeRange={time_range}...")
             response = requests.get(
-                f"{BASE_URL}/new-arrivals?timeRange={time_range}&limit=5"
+                f"{BASE_URL}/new-arrivals/new-arrivals?timeRange={time_range}&limit=5"
             )
             assert (
                 response.status_code == 200
@@ -387,7 +387,7 @@ class TestNewArrivals:
         for time_range in invalid_ranges:
             print(f"\nTesting invalid timeRange='{time_range}'...")
             response = requests.get(
-                f"{BASE_URL}/new-arrivals?timeRange={time_range}&limit=5"
+                f"{BASE_URL}/new-arrivals/new-arrivals?timeRange={time_range}&limit=5"
             )
             assert (
                 response.status_code == 200
@@ -400,7 +400,7 @@ class TestNewArrivals:
 
         # Test no timeRange parameter (should use default)
         print(f"\nTesting no timeRange parameter (should use default 30d)...")
-        response = requests.get(f"{BASE_URL}/new-arrivals?limit=5")
+        response = requests.get(f"{BASE_URL}/new-arrivals/new-arrivals?limit=5")
         assert response.status_code == 200
         data = response.json()
         assert "items" in data
@@ -412,7 +412,7 @@ class TestNewArrivals:
         """Test that arrival_date field has correct YYYYMMDD format"""
         print(f"\n=== ARRIVAL DATE FORMAT VALIDATION ===")
 
-        response = requests.get(f"{BASE_URL}/new-arrivals?limit=10")
+        response = requests.get(f"{BASE_URL}/new-arrivals/new-arrivals?limit=10")
         assert response.status_code == 200
         data = response.json()
         assert "items" in data
@@ -553,12 +553,12 @@ def test_comprehensive_stock_filtering():
         print("\n9. Final Analysis and Recommendations...")
 
         response_true = requests.get(
-            f"{BASE_URL}/new-arrivals?inStockOnly=true&limit=20"
+            f"{BASE_URL}/new-arrivals/new-arrivals?inStockOnly=true&limit=20"
         )
         response_false = requests.get(
-            f"{BASE_URL}/new-arrivals?inStockOnly=false&limit=20"
+            f"{BASE_URL}/new-arrivals/new-arrivals?inStockOnly=false&limit=20"
         )
-        response_null = requests.get(f"{BASE_URL}/new-arrivals?limit=20")
+        response_null = requests.get(f"{BASE_URL}/new-arrivals/new-arrivals?limit=20")
 
         if all(
             r.status_code == 200 for r in [response_true, response_false, response_null]
