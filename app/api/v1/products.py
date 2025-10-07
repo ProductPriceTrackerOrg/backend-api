@@ -573,14 +573,14 @@ async def get_price_anomalies(
 @router.get("/{product_id}/similar", response_model=SimilarProductsResponse)
 async def get_similar_products(
     product_id: int = Path(..., description="The ID of the product"),
-    limit: int = Query(6, ge=1, le=20, description="Number of similar products to return"),
+    limit: int = Query(8, ge=1, le=20, description="Number of similar products to return"),
     response: Response = None,
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:
     """
-    Get products similar to the specified product using a single, efficient, and secure query.
+    Get products similar to the specified product using ML-generated recommendations.
     
-    Finds products in the same category with similar attributes.
+    Retrieves pre-calculated similar product recommendations from the FactProductRecommendation table.
     """
     cache_key = f"product:{product_id}:similar:limit{limit}"
     
@@ -590,79 +590,61 @@ async def get_similar_products(
         return cached_data
     
     try:
-        # This single query is parameterized, efficient, and handles all logic in BigQuery.
+        # Use the FactProductRecommendation table to get pre-calculated similar products
         query = f"""
-        WITH
-          -- Step 1: Get the attributes and average price of our base product ONCE.
-          BaseProduct AS (
+        WITH LatestPrices AS (
+            -- Get the latest prices for all products
             SELECT
-              p.brand_native,
-              p.predicted_master_category_id AS category_id,
-              AVG(lp.current_price) AS avg_price
-            FROM
-              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS p
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON p.shop_product_id = v.shop_product_id
-            JOIN (
-                SELECT variant_id, current_price FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
-                QUALIFY ROW_NUMBER() OVER(PARTITION BY variant_id ORDER BY date_id DESC) = 1
-            ) AS lp ON v.variant_id = lp.variant_id
-            WHERE p.shop_product_id = @product_id
-            GROUP BY 1, 2
-          ),
-          
-          -- Step 2: Get latest prices for all products (to avoid duplicate QUALIFY statements)
-          LatestPrices AS (
-            SELECT
-              v.variant_id, 
-              v.shop_product_id,
-              fpp.current_price,
-              fpp.original_price,
-              fpp.is_available
+                v.variant_id, 
+                v.shop_product_id,
+                fpp.current_price,
+                fpp.original_price,
+                fpp.is_available
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp ON v.variant_id = fpp.variant_id
             QUALIFY ROW_NUMBER() OVER(PARTITION BY v.variant_id ORDER BY fpp.date_id DESC) = 1
-          ),
-
-          -- Step 3: Calculate similarity scores for all other products.
-          SimilarProducts AS (
+        ),
+        
+        -- Get recommended products from the recommendation table
+        RecommendedProducts AS (
             SELECT
-              sp.shop_product_id AS id,
-              sp.product_title_native AS name,
-              sp.brand_native AS brand,
-              c.category_name AS category,
-              lp.current_price AS price,
-              lp.original_price,
-              s.shop_name AS retailer,
-              pi.image_url AS image,
-              -- This calculation uses a CROSS JOIN with our base product data
-              (
-                CASE WHEN sp.brand_native = bp.brand_native THEN 50 ELSE 0 END +
-                CASE WHEN sp.predicted_master_category_id = bp.category_id THEN 30 ELSE 0 END +
-                CASE WHEN lp.current_price BETWEEN bp.avg_price * 0.7 AND bp.avg_price * 1.3 THEN 20 ELSE 0 END
-              ) AS similarity_score
-            FROM
-              `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
-            CROSS JOIN BaseProduct AS bp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
-            JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
-            WHERE
-              sp.shop_product_id != @product_id AND lp.is_available = TRUE
-          )
+                fpr.recommended_shop_product_id AS id,
+                fpr.recommendation_score AS similarity_score,
+                fpr.recommendation_type,
+                dm.model_name
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductRecommendation` AS fpr
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimModel` AS dm ON fpr.model_id = dm.model_id
+            WHERE fpr.source_shop_product_id = @product_id
+            AND fpr.recommendation_type = 'similar'
+            ORDER BY fpr.recommendation_score DESC
+            LIMIT @limit
+        )
 
-        -- Step 3: First filter products based on similarity, then group
+        -- Join with product details to get complete information
         SELECT
-            id, name, brand, category,
-            -- This pattern ensures the other fields correspond to the row with the minimum price.
-            ARRAY_AGG(STRUCT(price, original_price, retailer, image) ORDER BY price ASC LIMIT 1)[OFFSET(0)].*,
-            MAX(similarity_score) AS similarity_score
-        FROM SimilarProducts
-        WHERE similarity_score > 30 -- Filter out products that are not very similar
-        GROUP BY id, name, brand, category
-        ORDER BY similarity_score DESC, price ASC
-        LIMIT @limit
+            rp.id, 
+            sp.product_title_native AS name,
+            sp.brand_native AS brand,
+            c.category_name AS category,
+            lp.current_price AS price,
+            lp.original_price,
+            s.shop_name AS retailer,
+            pi.image_url AS image,
+            rp.similarity_score,
+            rp.model_name
+        FROM RecommendedProducts AS rp
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp ON rp.id = sp.shop_product_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
+        LEFT JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
+        -- INNER JOIN instead of LEFT JOIN to ensure all products have images
+        INNER JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi 
+            ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        WHERE lp.is_available = TRUE
+        -- In case we have multiple variants, group by product and take the lowest price
+        GROUP BY rp.id, name, brand, category, retailer, image, similarity_score, model_name, lp.original_price, lp.current_price
+        ORDER BY similarity_score DESC
         """
         
         # Use query parameters to prevent SQL injection
@@ -676,7 +658,70 @@ async def get_similar_products(
         query_job = bq_client.query(query, job_config=job_config)
         results = [dict(row) for row in query_job.result()]
         
-        # Format the similar products (no transformation needed with new query)
+        # Check if we got recommendations - fall back to category-based if not
+        if not results:
+            # Fallback to category-based recommendations if no ML recommendations exist
+            fallback_query = f"""
+            WITH
+              -- Step 1: Get base product category and brand
+              BaseProduct AS (
+                SELECT
+                  p.brand_native,
+                  p.predicted_master_category_id AS category_id
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS p
+                WHERE p.shop_product_id = @product_id
+              ),
+              
+              -- Step 2: Get latest prices
+              LatestPrices AS (
+                SELECT
+                  v.variant_id, 
+                  v.shop_product_id,
+                  fpp.current_price,
+                  fpp.original_price,
+                  fpp.is_available
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp ON v.variant_id = fpp.variant_id
+                QUALIFY ROW_NUMBER() OVER(PARTITION BY v.variant_id ORDER BY fpp.date_id DESC) = 1
+              )
+
+            -- Get products in the same category and/or brand
+            SELECT
+              sp.shop_product_id AS id,
+              sp.product_title_native AS name,
+              sp.brand_native AS brand,
+              c.category_name AS category,
+              MIN(lp.current_price) AS price,
+              MIN(lp.original_price) AS original_price,
+              s.shop_name AS retailer,
+              pi.image_url AS image,
+              -- Simple similarity score based on category and brand match
+              CASE 
+                WHEN sp.brand_native = bp.brand_native AND sp.predicted_master_category_id = bp.category_id THEN 100
+                WHEN sp.predicted_master_category_id = bp.category_id THEN 70
+                ELSE 50
+              END AS similarity_score,
+              'fallback' AS model_name
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS sp
+            CROSS JOIN BaseProduct AS bp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS c ON sp.predicted_master_category_id = c.category_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v ON sp.shop_product_id = v.shop_product_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS s ON sp.shop_id = s.shop_id
+            JOIN LatestPrices AS lp ON v.variant_id = lp.variant_id
+            -- INNER JOIN to ensure all products have images
+            INNER JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` AS pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            WHERE sp.shop_product_id != @product_id 
+              AND lp.is_available = TRUE
+              AND (sp.predicted_master_category_id = bp.category_id OR sp.brand_native = bp.brand_native)
+            GROUP BY id, name, brand, category, retailer, image, similarity_score, model_name
+            ORDER BY similarity_score DESC, price ASC
+            LIMIT @limit
+            """
+            
+            fallback_job = bq_client.query(fallback_query, job_config=job_config)
+            results = [dict(row) for row in fallback_job.result()]
+        
+        # Format the similar products
         result = {"similar_products": results}
         
         # Cache the result
@@ -694,7 +739,7 @@ async def get_similar_products(
 @router.get("/{product_id}/recommendations", response_model=RecommendationsResponse)
 async def get_product_recommendations(
     product_id: int = Path(..., description="The ID of the product"),
-    limit: int = Query(6, ge=1, le=20, description="Number of recommendations to return"),
+    limit: int = Query(4, ge=1, le=20, description="Number of recommendations to return"),
     current_user: Optional[Dict] = Depends(get_current_user),
     bq_client: bigquery.Client = Depends(get_bigquery_client),
     supabase_client = Depends(get_supabase_client)
@@ -730,9 +775,8 @@ async def get_product_recommendations(
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+            INNER JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
             WHERE fpr.user_id = '{user_id}'
-            AND sp.shop_product_id != {product_id}
             AND fpp.is_available = TRUE
             -- Get the latest price info
             QUALIFY ROW_NUMBER() OVER(PARTITION BY v.variant_id ORDER BY fpp.date_id DESC) = 1
@@ -783,7 +827,7 @@ async def get_product_recommendations(
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        INNER JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
         WHERE fpr.source_shop_product_id = {product_id}
         AND fpp.is_available = TRUE
         -- Get the latest price info
@@ -847,7 +891,7 @@ async def get_product_recommendations(
                     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
                     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
                     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
-                    LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+                    INNER JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
                     WHERE c.category_id = {category_id}
                     AND sp.shop_product_id != {product_id}
                     AND fpp.is_available = TRUE
