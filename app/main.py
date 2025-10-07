@@ -101,6 +101,10 @@ app.include_router(search.router, prefix="/api/v1/search", tags=["Search"])
 from app.api.v1 import retailers
 
 app.include_router(retailers.router, prefix="/api/v1/retailers", tags=["Retailers"])
+# Include the analytics routes
+from app.api.v1 import analytics
+
+app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 
 
 @app.get("/health")
