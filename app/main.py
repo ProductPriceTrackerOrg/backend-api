@@ -106,6 +106,10 @@ from app.api.v1 import analytics
 
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 
+from app.api.v1 import buyer_central
+
+app.include_router(buyer_central.router, prefix="/api/v1/buyer-central", tags=["Buyer Central"])
+
 
 @app.get("/health")
 async def health_check():
