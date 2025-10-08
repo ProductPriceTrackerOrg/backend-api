@@ -181,7 +181,7 @@ async def search_products(
         }
         
         # Cache the results for 1 hour (as recommended in the guide)
-        cache_service.set(cache_key, response, ttl=3600)
+        cache_service.set(cache_key, response, ttl_seconds=3600)
         
         return response
         
@@ -393,7 +393,7 @@ async def price_comparison(
         }
         
         # Cache the results for 4 hours (as recommended in the guide)
-        cache_service.set(cache_key, response, ttl=14400)
+        cache_service.set(cache_key, response, ttl_seconds=14400)
         
         return response
         
@@ -550,7 +550,7 @@ async def buying_guides_categories(
         }
         
         # Cache the results for 24 hours (as recommended in the guide)
-        cache_service.set(cache_key, response, ttl=86400)
+        cache_service.set(cache_key, response, ttl_seconds=86400)
         
         return response
         
