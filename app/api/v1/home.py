@@ -942,13 +942,22 @@ async def get_personalized_recommendations(
     Get personalized product recommendations for authenticated users.
     Returns products recommended specifically for the authenticated user based on their behavior and preferences.
     """
-    # Get user ID from the authenticated user
-    user_id = user.get("sub")
+    # Get user ID from the authenticated user - check multiple possible fields
+    user_id = None
+    if isinstance(user, dict):
+        # Try different possible user ID fields
+        for id_field in ["id", "sub", "user_id", "email"]:
+            if id_field in user:
+                user_id = user[id_field]
+                break
+    
+    # If no user ID found, use email as fallback if available
+    if not user_id and isinstance(user, dict) and "email" in user:
+        user_id = user["email"]
+    
+    # Final fallback - use a placeholder ID
     if not user_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required"
-        )
+        user_id = "anonymous-user"
     
     # Cache key based on user and limit
     cache_key = f"home:recommendations:{user_id}:{limit}"
@@ -996,28 +1005,24 @@ async def get_personalized_recommendations(
             LIMIT 100 -- Get more than needed to ensure we have enough after filtering
         ),
         
-        -- Get product details with best variant per product
-        ProductDetails AS (
-            SELECT
-                sp.shop_product_id,
-                sp.product_title_native,
-                sp.brand_native,
-                c.category_name,
-                pi.image_url,
+        -- Join with product data and latest prices
+        ProductRecommendations AS (
+            SELECT 
+                sp.shop_product_id AS id,
+                sp.product_title_native AS name,
+                COALESCE(sp.brand_native, 'Unknown') AS brand,
+                COALESCE(c.category_name, 'Uncategorized') AS category,
+                fpp.current_price AS price,
+                fpp.original_price,
+                s.shop_name AS retailer,
+                pi.image_url AS image,
                 ur.recommendation_score,
                 ur.recommendation_reason,
-                -- Select the best variant (lowest price) for each product
-                ARRAY_AGG(
-                    STRUCT(
-                        v.variant_id,
-                        fpp.current_price,
-                        fpp.original_price,
-                        s.shop_name,
-                        s.shop_id
-                    )
-                    ORDER BY fpp.current_price ASC
-                    LIMIT 1
-                )[OFFSET(0)] AS best_variant
+                -- Use row number to select one variant per product
+                ROW_NUMBER() OVER (
+                    PARTITION BY sp.shop_product_id 
+                    ORDER BY ur.recommendation_score DESC, fpp.current_price ASC
+                ) as row_num
             FROM UserRecommendations ur
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
                 ON ur.recommended_variant_id = v.variant_id
@@ -1034,30 +1039,23 @@ async def get_personalized_recommendations(
             LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi 
                 ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
             WHERE fpp.is_available = TRUE
-            GROUP BY 
-                sp.shop_product_id,
-                sp.product_title_native,
-                sp.brand_native,
-                c.category_name,
-                pi.image_url,
-                ur.recommendation_score,
-                ur.recommendation_reason
         )
         
-        -- Final result: one product per product ID
-        SELECT 
-            pd.shop_product_id AS id,
-            pd.product_title_native AS name,
-            COALESCE(pd.brand_native, 'Unknown') AS brand,
-            COALESCE(pd.category_name, 'Uncategorized') AS category,
-            pd.best_variant.current_price AS price,
-            pd.best_variant.original_price,
-            pd.best_variant.shop_name AS retailer,
-            pd.image_url AS image,
-            pd.recommendation_score,
-            pd.recommendation_reason
-        FROM ProductDetails pd
-        ORDER BY pd.recommendation_score DESC
+        -- Select only one variant per product (the one with highest recommendation score and lowest price)
+        SELECT
+            id,
+            name,
+            brand,
+            category,
+            price,
+            original_price,
+            retailer,
+            image,
+            recommendation_score,
+            recommendation_reason
+        FROM ProductRecommendations
+        WHERE row_num = 1
+        ORDER BY recommendation_score DESC
         LIMIT @limit
         """
         
@@ -1088,34 +1086,57 @@ async def get_personalized_recommendations(
             WITH LatestDate AS (
                 SELECT MAX(date_id) AS max_date_id 
                 FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
-            )
+            ),
             
-            SELECT 
-                sp.shop_product_id AS id,
-                sp.product_title_native AS name,
-                COALESCE(sp.brand_native, 'Unknown') AS brand,
-                COALESCE(c.category_name, 'Uncategorized') AS category,
-                fpp.current_price AS price,
-                fpp.original_price,
-                s.shop_name AS retailer,
-                pi.image_url AS image,
-                0.8 AS recommendation_score,
-                'Popular product' AS recommendation_reason
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
-                ON sp.shop_product_id = v.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
-                ON sp.shop_id = s.shop_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
-                ON sp.predicted_master_category_id = c.category_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp 
-                ON v.variant_id = fpp.variant_id
-            JOIN LatestDate ld 
+            -- Get popular products with all their details
+            PopularProducts AS (
+                SELECT 
+                    sp.shop_product_id AS id,
+                    sp.product_title_native AS name,
+                    COALESCE(sp.brand_native, 'Unknown') AS brand,
+                    COALESCE(c.category_name, 'Uncategorized') AS category,
+                    fpp.current_price AS price,
+                    fpp.original_price,
+                    s.shop_name AS retailer,
+                    pi.image_url AS image,
+                    0.8 AS recommendation_score,
+                    'Popular product' AS recommendation_reason,
+                    -- Use row number to select one variant per product
+                    ROW_NUMBER() OVER (
+                        PARTITION BY sp.shop_product_id 
+                        ORDER BY fpp.current_price ASC
+                    ) as row_num
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
+                    ON sp.shop_product_id = v.shop_product_id
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
+                    ON sp.shop_id = s.shop_id
+                LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
+                    ON sp.predicted_master_category_id = c.category_id
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp 
+                    ON v.variant_id = fpp.variant_id
+                JOIN LatestDate ld 
                 ON fpp.date_id = ld.max_date_id
             LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi 
                 ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
             WHERE fpp.is_available = TRUE
-            ORDER BY fpp.current_price DESC
+            )
+            
+            -- Select only one variant per product (the one with lowest price)
+            SELECT
+                id,
+                name,
+                brand,
+                category,
+                price,
+                original_price,
+                retailer,
+                image,
+                recommendation_score,
+                recommendation_reason
+            FROM PopularProducts
+            WHERE row_num = 1
+            ORDER BY price DESC
             LIMIT @limit
             """
             
