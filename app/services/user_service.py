@@ -75,3 +75,4 @@ def get_user_statistics() -> Dict[str, Any]:
             "newUsersToday": 0,
             "error": str(e)
         }
+        

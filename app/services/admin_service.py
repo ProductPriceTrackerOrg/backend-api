@@ -1,6 +1,8 @@
 # This service will contain all the business logic for the admin dashboard,
 # such as querying BigQuery for anomalies or PostgreSQL for user data.
 import logging
+import pandas as pd
+import numpy as np
 from google.cloud import bigquery
 from app.config import settings
 from google.api_core.exceptions import GoogleAPICallError
@@ -76,7 +78,7 @@ def get_pipeline_status_from_db():
     """
     pass
 
-# --- NEW FUNCTION 1: Get Pending Anomalies ---
+# 1: Get Pending Anomalies 
 def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: int = 20):
     """
     Fetches a paginated list of anomalies that are pending review.
@@ -102,13 +104,23 @@ def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: i
     """
     try:
         df = bq_client.query(query).to_dataframe()
-        # Convert the DataFrame to a list of dictionaries for JSON compatibility
-        return df.to_dict('records')
+        
+        # --- MORE ROBUST DATA SANITIZATION ---
+        # 1. Replace any special float values (Infinity, -Infinity) with pandas' standard Not a Number (NaN).
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        
+        # 2. Force the DataFrame to use standard Python objects instead of NumPy types.
+        #    This is the key step. It allows us to replace NaN with Python's `None`.
+        # 3. Use .where() to replace all NaN values with `None`, which is JSON compliant (becomes null).
+        cleaned_data = df.astype(object).where(pd.notna(df), None).to_dict('records')
+        
+        return cleaned_data
+    
     except GoogleAPICallError as e:
         print(f"An error occurred while fetching anomalies: {e}")
         return {"error": str(e)}
 
-# --- NEW FUNCTION 2: Resolve an Anomaly ---
+# 2: Resolve an Anomaly
 def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str, user_id: str):
     """
     Updates the status and reviewed_by_user_id of a specific anomaly in BigQuery.
