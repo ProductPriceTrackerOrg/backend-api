@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from google.cloud import bigquery
+from google.api_core import exceptions as google_exceptions
 import supabase
 from app.config import settings
 from app.api.deps import get_current_user, get_bigquery_client, get_current_user_optional
@@ -145,58 +146,68 @@ async def search_products(
               ON c.category_id = ip.category_id -- Additional check to ensure same category
           ),
 
-          -- Get image URLs for the products
+          -- Get image URLs for the products with proper ordering
+          AllProductImages AS (
+            SELECT
+              shop_product_id,
+              image_url,
+              sort_order,
+              ROW_NUMBER() OVER(PARTITION BY shop_product_id ORDER BY sort_order ASC) AS image_rank
+            FROM
+              `price-pulse-470211.warehouse.DimProductImage`
+          ),
+          
+          -- Select the primary image (with the lowest sort order) for each product
           ProductImages AS (
             SELECT
               shop_product_id,
               image_url
             FROM
-              `price-pulse-470211.warehouse.DimProductImage`
+              AllProductImages
             WHERE
-              sort_order = 1 -- Primary images only
+              image_rank = 1
           ),
 
-          -- Get the latest available price date for each product
-          LatestProductPriceDates AS (
-            SELECT
-              v.shop_product_id,
-              MAX(pp.date_id) AS latest_date_id
+          -- Debug: Check if prices exist at all for any product
+          PriceCheck AS (
+            SELECT 
+              variant_id,
+              COUNT(*) as price_count,
+              AVG(current_price) as avg_price,
+              MAX(current_price) as max_price
             FROM
-              `price-pulse-470211.warehouse.FactProductPrice` pp
-            JOIN
-              `price-pulse-470211.warehouse.DimVariant` v
-              ON pp.variant_id = v.variant_id
-            JOIN
-              ProductDetails pd
-              ON v.shop_product_id = pd.shop_product_id
-            WHERE
-              pp.is_available = TRUE
+              `price-pulse-470211.warehouse.FactProductPrice`
             GROUP BY
-              v.shop_product_id
+              variant_id
+            LIMIT 10
           ),
           
-          -- Calculate the lowest price for each product when variants are available
+          -- Get all prices for all matched products with the highest price value
           ProductPrices AS (
             SELECT
               v.shop_product_id,
-              MIN(CASE 
-                WHEN pp.current_price > 0 THEN pp.current_price 
-                ELSE COALESCE(pp.original_price, 0) 
-              END) AS lowest_price
+              MAX(pp.current_price) AS highest_price
             FROM
-              `price-pulse-470211.warehouse.FactProductPrice` pp
-            JOIN
               `price-pulse-470211.warehouse.DimVariant` v
-              ON pp.variant_id = v.variant_id
             JOIN
-              LatestProductPriceDates lpd
-              ON v.shop_product_id = lpd.shop_product_id AND pp.date_id = lpd.latest_date_id
-            WHERE
-              pp.is_available = TRUE
+              ProductDetails pd ON v.shop_product_id = pd.shop_product_id
+            LEFT JOIN
+              `price-pulse-470211.warehouse.FactProductPrice` pp ON v.variant_id = pp.variant_id
             GROUP BY
               v.shop_product_id
-          )
+          ),
 
+          -- Get additional images for products where primary image might be missing
+          ProductImagesFallback AS (
+            SELECT
+              shop_product_id,
+              MIN(image_url) AS fallback_image_url
+            FROM
+              `price-pulse-470211.warehouse.DimProductImage`
+            GROUP BY
+              shop_product_id
+          )
+          
         -- Final result combining all data
         SELECT
           pd.shop_product_id AS id,
@@ -204,22 +215,26 @@ async def search_products(
           pd.brand_native AS brand,
           pd.category_name AS category,
           pd.retailer AS retailer,
-          COALESCE(pp.lowest_price, 0) AS currentPrice,
+          COALESCE(pp.highest_price, 0) AS currentPrice,
           pd.product_url AS productUrl,
-          pi.image_url AS image
+          -- Use COALESCE with pre-calculated fallback image
+          COALESCE(pi.image_url, pif.fallback_image_url) AS image
         FROM
           ProductDetails pd
         LEFT JOIN
           ProductImages pi
           ON pd.shop_product_id = pi.shop_product_id
         LEFT JOIN
+          ProductImagesFallback pif
+          ON pd.shop_product_id = pif.shop_product_id
+        LEFT JOIN
           ProductPrices pp
           ON pd.shop_product_id = pp.shop_product_id
         WHERE
           (@category_id IS NULL OR pd.category_id = @category_id)
         ORDER BY
-          pp.lowest_price IS NULL,
-          pp.lowest_price ASC
+          pp.highest_price IS NULL,
+          pp.highest_price DESC  -- Sort by highest price in descending order
         LIMIT
           @limit
         """
@@ -231,6 +246,7 @@ async def search_products(
         # Process results
         products = []
         for row in results:
+            
             products.append({
                 "id": row.id,
                 "name": row.name,
@@ -254,10 +270,15 @@ async def search_products(
         
         return response
         
-    except bigquery.exceptions.GoogleCloudError as e:
+    except google_exceptions.BadRequest as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"BigQuery syntax error: {e}"
+        )
+    except google_exceptions.GoogleAPIError as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Google BigQuery error during product search: {e}"
+            detail=f"Google BigQuery API error: {e}"
         )
     except ValueError as e:
         raise HTTPException(
@@ -590,13 +611,17 @@ async def buying_guides_categories(
             ELSE CONCAT('Buying guides for ', cs.category_name)
           END AS description,
           CASE
-            WHEN cs.category_name = 'Smartphones' THEN '📱'
+            WHEN cs.category_name = 'Mobile Phones' THEN '📱'
             WHEN cs.category_name = 'Laptops' THEN '💻'
-            WHEN cs.category_name = 'Audio' THEN '🎧'
-            WHEN cs.category_name = 'Smart Watches' THEN '⌚'
-            WHEN cs.category_name = 'Cameras' THEN '📷'
+            WHEN cs.category_name = 'Headphones & Earbuds' THEN '🎧'
+            WHEN cs.category_name = 'Smart Watches & Accessories' THEN '⌚'
+            WHEN cs.category_name = 'Cameras & Drones' THEN '📷'
             WHEN cs.category_name = 'Tablets' THEN '📱'
-            WHEN cs.category_name = 'Gaming' THEN '🎮'
+            WHEN cs.category_name = 'Gaming Peripherals' THEN '🎮'
+            WHEN cs.category_name = 'Speakers' THEN '📢'
+            WHEN cs.category_name = 'Chargers & Power Banks' THEN '🔋'
+            WHEN cs.category_name = 'Cables & Adapters' THEN '🔌'
+            WHEN cs.category_name = 'Mice' THEN '🖱️'
             ELSE '📦'
           END AS icon,
           FLOOR(SQRT(cs.product_count) * 2) AS guideCount, -- Simulated guide count
@@ -609,7 +634,7 @@ async def buying_guides_categories(
           ON cs.category_id = tb.category_id
         ORDER BY
           cs.product_count DESC
-        LIMIT 10
+        LIMIT 9
         """
         
         # Execute query
