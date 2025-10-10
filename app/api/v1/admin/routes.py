@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from google.cloud import bigquery
 from .dependencies import get_current_admin_user
-from app.services import admin_service 
+from app.services import admin_service, user_service
 from app.api.deps import get_bigquery_client
 from pydantic import BaseModel
-from typing import Dict
+from typing import Dict, Optional
+from datetime import date, timedelta
 
 # All routes in this file will have the prefix /admin
 # and will be protected by our admin security dependency.
@@ -14,6 +15,7 @@ router = APIRouter(
     dependencies=[Depends(get_current_admin_user)]
 )
 
+# Dashboard stats fetching end point
 @router.get("/dashboard-stats")
 async def get_dashboard_stats(bq_client: bigquery.Client = Depends(get_bigquery_client)):
     """
@@ -24,6 +26,8 @@ async def get_dashboard_stats(bq_client: bigquery.Client = Depends(get_bigquery_
     live_stats = admin_service.get_dashboard_stats_from_db(bq_client)
     return live_stats
 
+
+# Anomaly fetching end point
 @router.get("/anomalies")
 async def get_anomalies(
     page: int = 1, 
@@ -44,7 +48,7 @@ async def get_anomalies(
 class AnomalyResolution(BaseModel):
     resolution: str
 
-# Resolve an Anomaly ---
+# Anomaly Resolving end point ---
 @router.post("/anomalies/{anomaly_id}/resolve")
 async def resolve_anomaly_endpoint(
     anomaly_id: int,
@@ -74,3 +78,26 @@ async def resolve_anomaly_endpoint(
         
     return result
 
+# User Sign-Ups analytics end point
+@router.get("/analytics/user-signups")
+async def get_user_signups_analytics(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    days: int = 30
+):
+    """
+    Fetches user sign-up data for the analytics chart.
+    Can be filtered by a specific date range or a number of past days.
+    """
+    # If no specific dates are provided, calculate the range based on the 'days' parameter.
+    if start_date is None or end_date is None:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days - 1)
+        
+    # Call the service function to get the data
+    signup_data = user_service.get_user_signups_over_time(start_date, end_date)
+    
+    if "error" in signup_data:
+        raise HTTPException(status_code=500, detail=signup_data["error"])
+        
+    return signup_data

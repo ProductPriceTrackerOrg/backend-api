@@ -3,9 +3,10 @@ User service for operations related to user data.
 Provides functions for retrieving user statistics and details.
 """
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from app.db.supabase_client import get_supabase_client
 from app.services.cache_service import cache_service
+from datetime import date, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -76,3 +77,54 @@ def get_user_statistics() -> Dict[str, Any]:
             "error": str(e)
         }
         
+
+# --- NEW FUNCTION for User Sign-ups Chart ---
+def get_user_signups_over_time(start_date: date, end_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetches the number of user sign-ups per day over a given date range.
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # The 'created_at' column is assumed to be in the 'profiles' table.
+        # This query counts users grouped by the date part of their creation timestamp.
+        # It filters for users created within the specified date range.
+        response = supabase.rpc('get_daily_user_signups', {
+            'start_date_param': str(start_date),
+            'end_date_param': str(end_date)
+        }).execute()
+
+        data = response.data
+        
+        # The RPC will return a list like [{"signup_date": "2025-09-20", "signup_count": 35}]
+        # We need to format it for the frontend.
+        chart_data = [{"date": item['signup_date'], "signups": item['signup_count']} for item in data]
+        
+        # Optional: Fill in missing dates with 0 signups for a continuous line chart
+        # This part can be added later if needed for UI perfection.
+
+        return chart_data
+
+    except Exception as e:
+        logger.error(f"Error fetching user signups over time: {e}")
+        return [{"error": str(e)}]
+
+  
+# ```
+
+# **Important:** The query above uses a Supabase RPC (Remote Procedure Call). You need to create this function in your Supabase SQL Editor once.
+
+# **Run this in Supabase SQL Editor:**
+# ```sql
+# CREATE OR REPLACE FUNCTION get_daily_user_signups(start_date_param date, end_date_param date)
+# RETURNS TABLE (signup_date date, signup_count int) AS $$
+# BEGIN
+#     RETURN QUERY
+#     SELECT DATE(created_at) AS signup_date, COUNT(*)::int AS signup_count
+#     FROM auth.users -- Standard Supabase table for user creation dates
+#     WHERE DATE(created_at) >= start_date_param AND DATE(created_at) <= end_date_param
+#     GROUP BY DATE(created_at)
+#     ORDER BY DATE(created_at);
+# END;
+# $$ LANGUAGE plpgsql;
+
