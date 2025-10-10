@@ -39,6 +39,7 @@ async def search_products(
     """
     Search for products by exact product name and find matching products across retailers.
     Returns a list of products with their retailer information, lowest price, and URLs.
+    All returned products will be from the same category as the initially matched product.
     """
     # Cache key based on search parameters
     cache_key = f"buyer-central:search:{query}:{limit}:{category_id}"
@@ -78,6 +79,7 @@ async def search_products(
               sp.product_url,
               c.category_name,
               c.category_id,
+              sp.predicted_master_category_id,
               s.shop_name AS retailer,
               pm.match_group_id
             FROM
@@ -98,6 +100,7 @@ async def search_products(
           ),
           
           -- Find all matching products based on match_group_id from the initial product
+          -- AND ensure they are from the same category as the initial product
           MatchingProducts AS (
             SELECT DISTINCT
               pm.match_group_id,
@@ -107,9 +110,15 @@ async def search_products(
             JOIN
               InitialProduct ip
               ON pm.match_group_id = ip.match_group_id
+            JOIN
+              `price-pulse-470211.warehouse.DimShopProduct` sp
+              ON pm.shop_product_id = sp.shop_product_id
+            WHERE
+              -- Ensure the product is in the same category as the initial product
+              sp.predicted_master_category_id = (SELECT predicted_master_category_id FROM InitialProduct LIMIT 1)
           ),
           
-          -- Get all product details for matching products
+          -- Get all product details for matching products (already filtered by same category)
           ProductDetails AS (
             SELECT
               sp.shop_product_id,
@@ -131,6 +140,9 @@ async def search_products(
             JOIN
               `price-pulse-470211.warehouse.DimShop` s
               ON sp.shop_id = s.shop_id
+            JOIN
+              InitialProduct ip
+              ON c.category_id = ip.category_id -- Additional check to ensure same category
           ),
 
           -- Get image URLs for the products
