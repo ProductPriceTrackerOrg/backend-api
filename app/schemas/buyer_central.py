@@ -15,7 +15,9 @@ class SearchProductItem(BaseModel):
     name: str
     brand: Optional[str] = None
     category: Optional[str] = "Uncategorized"
-    avgPrice: float
+    retailer: Optional[str] = None
+    currentPrice: float
+    productUrl: Optional[str] = None
     image: Optional[str] = None
 
 

@@ -31,14 +31,14 @@ def get_supabase_client():
 
 @router.get("/search-products", response_model=SearchProductsResponse)
 async def search_products(
-    query: str = Query(..., description="The search query"),
-    limit: int = Query(10, description="Maximum number of results to return", ge=1, le=50),
+    query: str = Query(..., description="The full product name to search for"),
+    limit: int = Query(4, description="Maximum number of results to return", ge=1, le=5),
     category_id: Optional[int] = Query(None, description="Filter by category ID"),
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:
     """
-    Search for products to compare prices across retailers.
-    Returns a list of products matching the search query.
+    Search for products by exact product name and find matching products across retailers.
+    Returns a list of products with their retailer information, lowest price, and URLs.
     """
     # Cache key based on search parameters
     cache_key = f"buyer-central:search:{query}:{limit}:{category_id}"
@@ -66,17 +66,19 @@ async def search_products(
             query_parameters=query_params
         )
         
-        # BigQuery SQL following the provided implementation
+        # BigQuery SQL implementation to search by full product name and find matching products
         sql = """
         WITH
-          -- Get top matched products from the search term
-          MatchedProducts AS (
+          -- Get the initial product based on exact product name
+          InitialProduct AS (
             SELECT
               sp.shop_product_id,
               sp.product_title_native,
               sp.brand_native,
+              sp.product_url,
               c.category_name,
               c.category_id,
+              s.shop_name AS retailer,
               pm.match_group_id
             FROM
               `price-pulse-470211.warehouse.DimShopProduct` sp
@@ -84,12 +86,51 @@ async def search_products(
               `price-pulse-470211.warehouse.DimCategory` c
               ON sp.predicted_master_category_id = c.category_id
             JOIN
+              `price-pulse-470211.warehouse.DimShop` s
+              ON sp.shop_id = s.shop_id  
+            JOIN
               `price-pulse-470211.warehouse.FactProductMatch` pm
               ON sp.shop_product_id = pm.shop_product_id
             WHERE
-              LOWER(sp.product_title_native) LIKE CONCAT('%', LOWER(@query), '%')
-              OR LOWER(sp.brand_native) LIKE CONCAT('%', LOWER(@query), '%')
-            LIMIT 1000  -- Initial filter to process manageable data
+              LOWER(sp.product_title_native) = LOWER(@query)
+              OR LOWER(CONCAT(sp.brand_native, ' ', sp.product_title_native)) = LOWER(@query)
+            LIMIT 1  -- Get the exact match only
+          ),
+          
+          -- Find all matching products based on match_group_id from the initial product
+          MatchingProducts AS (
+            SELECT DISTINCT
+              pm.match_group_id,
+              pm.shop_product_id
+            FROM
+              `price-pulse-470211.warehouse.FactProductMatch` pm
+            JOIN
+              InitialProduct ip
+              ON pm.match_group_id = ip.match_group_id
+          ),
+          
+          -- Get all product details for matching products
+          ProductDetails AS (
+            SELECT
+              sp.shop_product_id,
+              sp.product_title_native,
+              sp.brand_native,
+              sp.product_url,
+              c.category_name,
+              c.category_id,
+              s.shop_name AS retailer,
+              mp.match_group_id
+            FROM
+              `price-pulse-470211.warehouse.DimShopProduct` sp
+            JOIN
+              MatchingProducts mp
+              ON sp.shop_product_id = mp.shop_product_id
+            JOIN
+              `price-pulse-470211.warehouse.DimCategory` c
+              ON sp.predicted_master_category_id = c.category_id
+            JOIN
+              `price-pulse-470211.warehouse.DimShop` s
+              ON sp.shop_id = s.shop_id
           ),
 
           -- Get image URLs for the products
@@ -103,56 +144,70 @@ async def search_products(
               sort_order = 1 -- Primary images only
           ),
 
-          -- Calculate average prices by match group
-          AveragePrices AS (
+          -- Get the latest available price date for each product
+          LatestProductPriceDates AS (
             SELECT
-              pm.match_group_id,
-              AVG(pp.current_price) AS avg_price
+              v.shop_product_id,
+              MAX(pp.date_id) AS latest_date_id
             FROM
               `price-pulse-470211.warehouse.FactProductPrice` pp
             JOIN
               `price-pulse-470211.warehouse.DimVariant` v
               ON pp.variant_id = v.variant_id
             JOIN
-              MatchedProducts pm
-              ON v.shop_product_id = pm.shop_product_id
+              ProductDetails pd
+              ON v.shop_product_id = pd.shop_product_id
             WHERE
-              pp.date_id = (
-                SELECT MAX(date_id)
-                FROM `price-pulse-470211.warehouse.FactProductPrice`
-              )
+              pp.is_available = TRUE
             GROUP BY
-              pm.match_group_id
+              v.shop_product_id
+          ),
+          
+          -- Calculate the lowest price for each product when variants are available
+          ProductPrices AS (
+            SELECT
+              v.shop_product_id,
+              MIN(CASE 
+                WHEN pp.current_price > 0 THEN pp.current_price 
+                ELSE COALESCE(pp.original_price, 0) 
+              END) AS lowest_price
+            FROM
+              `price-pulse-470211.warehouse.FactProductPrice` pp
+            JOIN
+              `price-pulse-470211.warehouse.DimVariant` v
+              ON pp.variant_id = v.variant_id
+            JOIN
+              LatestProductPriceDates lpd
+              ON v.shop_product_id = lpd.shop_product_id AND pp.date_id = lpd.latest_date_id
+            WHERE
+              pp.is_available = TRUE
+            GROUP BY
+              v.shop_product_id
           )
 
         -- Final result combining all data
         SELECT
-          mp.match_group_id AS id,
-          mp.product_title_native AS name,
-          mp.brand_native AS brand,
-          mp.category_name AS category,
-          COALESCE(ap.avg_price, 0) AS avgPrice,
+          pd.shop_product_id AS id,
+          pd.product_title_native AS name,
+          pd.brand_native AS brand,
+          pd.category_name AS category,
+          pd.retailer AS retailer,
+          COALESCE(pp.lowest_price, 0) AS currentPrice,
+          pd.product_url AS productUrl,
           pi.image_url AS image
         FROM
-          MatchedProducts mp
+          ProductDetails pd
         LEFT JOIN
           ProductImages pi
-          ON mp.shop_product_id = pi.shop_product_id
+          ON pd.shop_product_id = pi.shop_product_id
         LEFT JOIN
-          AveragePrices ap
-          ON mp.match_group_id = ap.match_group_id
+          ProductPrices pp
+          ON pd.shop_product_id = pp.shop_product_id
         WHERE
-          (@category_id IS NULL OR mp.category_id = @category_id)
-        GROUP BY
-          mp.match_group_id,
-          mp.product_title_native,
-          mp.brand_native,
-          mp.category_name,
-          ap.avg_price,
-          pi.image_url
+          (@category_id IS NULL OR pd.category_id = @category_id)
         ORDER BY
-          ap.avg_price IS NULL,
-          ap.avg_price DESC
+          pp.lowest_price IS NULL,
+          pp.lowest_price ASC
         LIMIT
           @limit
         """
@@ -169,7 +224,9 @@ async def search_products(
                 "name": row.name,
                 "brand": row.brand,
                 "category": row.category,
-                "avgPrice": row.avgPrice,
+                "retailer": row.retailer,
+                "currentPrice": row.currentPrice,
+                "productUrl": row.productUrl,
                 "image": row.image
             })
         
@@ -185,6 +242,16 @@ async def search_products(
         
         return response
         
+    except bigquery.exceptions.GoogleCloudError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google BigQuery error during product search: {e}"
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid input parameter: {e}"
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
