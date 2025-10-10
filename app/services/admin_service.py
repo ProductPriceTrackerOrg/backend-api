@@ -7,6 +7,8 @@ from google.cloud import bigquery
 from app.config import settings
 from google.api_core.exceptions import GoogleAPICallError
 from app.services.user_service import get_total_users_count
+from typing import Dict, Any, List
+from datetime import date, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +80,7 @@ def get_pipeline_status_from_db():
     """
     pass
 
-# 1: Get Pending Anomalies 
+# Get Pending Anomalies 
 def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: int = 20):
     """
     Fetches a paginated list of anomalies that are pending review.
@@ -120,7 +122,7 @@ def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: i
         print(f"An error occurred while fetching anomalies: {e}")
         return {"error": str(e)}
 
-# 2: Resolve an Anomaly
+# Resolve an Anomaly
 def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str, user_id: str):
     """
     Updates the status and reviewed_by_user_id of a specific anomaly in BigQuery.
@@ -145,4 +147,47 @@ def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str
     except GoogleAPICallError as e:
         print(f"An error occurred while resolving anomaly {anomaly_id}: {e}")
         return {"error": str(e)}
+
+
+# Category distribution
+def get_category_distribution(bq_client: bigquery.Client, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetches the distribution of products across different categories for a pie chart.
+    """
+    try:
+        if bq_client is None: raise Exception("BigQuery client not provided.")
+
+        # This query joins products with categories, filters by date,
+        # groups by category name, and counts the products in each.
+        query = f"""
+            SELECT
+                cat.category_name AS name,
+                COUNT(prod.shop_product_id) AS value
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS prod
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` AS cat
+                ON prod.predicted_master_category_id = cat.category_id
+            WHERE prod.scraped_date BETWEEN @start_date AND @end_date
+            AND cat.category_name IS NOT NULL
+            GROUP BY cat.category_name
+            ORDER BY value DESC
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+            ]
+        )
+        
+        df = bq_client.query(query, job_config=job_config).to_dataframe()
+
+        if df.empty:
+            return []
+        
+        # The frontend pie chart expects a 'name' and a 'value' for each slice.
+        # We can return the raw counts, and the frontend can calculate percentages for the labels.
+        return df.to_dict('records')
+
+    except (GoogleAPICallError, Exception) as e:
+        print(f"An error occurred while fetching category distribution: {e}")
+        return [{"error": str(e)}]
 

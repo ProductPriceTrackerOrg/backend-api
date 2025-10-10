@@ -101,3 +101,28 @@ async def get_user_signups_analytics(
         raise HTTPException(status_code=500, detail=signup_data["error"])
         
     return signup_data
+
+
+
+# Category Distribution end point
+@router.get("/analytics/category-distribution")
+async def get_category_distribution_analytics(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    days: int = 30,
+    bq_client: bigquery.Client = Depends(get_bigquery_client)
+):
+    """
+    Fetches the distribution of products across categories for a pie chart.
+    """
+    if start_date is None or end_date is None:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days - 1)
+    
+    category_data = admin_service.get_category_distribution(bq_client, start_date, end_date)
+    
+    if isinstance(category_data, list) and category_data and "error" in category_data[0]:
+        raise HTTPException(status_code=500, detail=category_data[0]["error"])
+        
+    return category_data
+
