@@ -224,14 +224,42 @@ async def price_comparison(
         # BigQuery SQL following the provided implementation
         sql = """
         -- Parse product IDs from comma-separated string
-        WITH
+        WITH 
           ProductIDs AS (
             SELECT CAST(value AS INT64) as product_id
             FROM UNNEST(SPLIT(@product_ids, ',')) as value
+            WHERE TRIM(value) != ''
           ),
-
-          -- Get product info including latest prices
-          ProductInfo AS (
+          
+          -- Simplify the query to focus on getting product info first
+          BasicProductInfo AS (
+            SELECT 
+              pm.match_group_id AS product_id,
+              sp.product_title_native AS product_name,
+              c.category_name,
+              COUNT(v.variant_id) AS variant_count
+            FROM 
+              ProductIDs p
+            JOIN
+              `price-pulse-470211.warehouse.FactProductMatch` pm
+              ON p.product_id = pm.match_group_id
+            JOIN
+              `price-pulse-470211.warehouse.DimShopProduct` sp
+              ON pm.shop_product_id = sp.shop_product_id
+            JOIN
+              `price-pulse-470211.warehouse.DimCategory` c
+              ON sp.predicted_master_category_id = c.category_id
+            LEFT JOIN
+              `price-pulse-470211.warehouse.DimVariant` v
+              ON sp.shop_product_id = v.shop_product_id
+            GROUP BY
+              pm.match_group_id, 
+              sp.product_title_native,
+              c.category_name
+          ),
+          
+          -- Latest prices
+          ProductPrices AS (
             SELECT
               pm.match_group_id AS product_id,
               sp.product_title_native AS product_name,
@@ -243,7 +271,10 @@ async def price_comparison(
               pp.is_available,
               d.full_date AS price_date
             FROM
+              ProductIDs p
+            JOIN
               `price-pulse-470211.warehouse.FactProductMatch` pm
+              ON p.product_id = pm.match_group_id
             JOIN
               `price-pulse-470211.warehouse.DimShopProduct` sp
               ON pm.shop_product_id = sp.shop_product_id
@@ -262,114 +293,91 @@ async def price_comparison(
             JOIN
               `price-pulse-470211.warehouse.DimDate` d
               ON pp.date_id = d.date_id
-            JOIN
-              ProductIDs p
-              ON pm.match_group_id = p.product_id
             WHERE
               pp.date_id = (
                 SELECT MAX(date_id)
                 FROM `price-pulse-470211.warehouse.FactProductPrice`
               )
           ),
-
-          -- Calculate average prices by product
+          
+          -- Calculate average prices
           AvgPrices AS (
             SELECT
               product_id,
               AVG(price) AS avg_price
             FROM
-              ProductInfo
+              ProductPrices
             GROUP BY
               product_id
           ),
-
-          -- Calculate price history trends
-          PriceHistory AS (
-            SELECT
-              pi.product_id,
-              (
-                (AVG(current.price) - AVG(previous.price)) / AVG(previous.price)
-              ) * 100 AS price_change,
-              CASE
-                WHEN (AVG(current.price) - AVG(previous.price)) < -1 THEN 'decreasing'
-                WHEN (AVG(current.price) - AVG(previous.price)) > 1 THEN 'increasing'
-                ELSE 'stable'
-              END AS trend
-            FROM
-              ProductInfo pi
-            JOIN
-              `price-pulse-470211.warehouse.FactProductPrice` current
-              ON pi.variant_id = current.variant_id
-            JOIN
-              `price-pulse-470211.warehouse.DimDate` current_date
-              ON current.date_id = current_date.date_id
-            JOIN
-              `price-pulse-470211.warehouse.FactProductPrice` previous
-              ON pi.variant_id = previous.variant_id
-            JOIN
-              `price-pulse-470211.warehouse.DimDate` previous_date
-              ON previous.date_id = previous_date.date_id
-            WHERE
-              current_date.full_date = (
-                SELECT MAX(full_date)
-                FROM `price-pulse-470211.warehouse.DimDate`
-              )
-              AND previous_date.full_date = (
-                SELECT MAX(full_date)
-                FROM `price-pulse-470211.warehouse.DimDate`
-                WHERE full_date < (SELECT MAX(full_date) FROM `price-pulse-470211.warehouse.DimDate`)
-                        AND full_date >= DATE_SUB(
-                          (SELECT MAX(full_date) FROM `price-pulse-470211.warehouse.DimDate`),
-                          INTERVAL 30 DAY
-                        )
-              )
-            GROUP BY
-              pi.product_id
+          
+          -- Add debug info
+          DebugInfo AS (
+            SELECT 
+              (SELECT COUNT(*) FROM ProductIDs) AS product_ids_count,
+              (SELECT COUNT(*) FROM BasicProductInfo) AS basic_info_count,
+              (SELECT COUNT(*) FROM ProductPrices) AS prices_count
           )
 
         -- Final result with structured response
         SELECT
-          pi.product_id AS productId,
-          MAX(pi.product_name) AS productName,
-          MAX(pi.category_name) AS categoryName,
-          ap.avg_price AS averagePrice,
+          bp.product_id AS productId,
+          bp.product_name AS productName,
+          bp.category_name AS categoryName,
+          COALESCE(ap.avg_price, 0) AS averagePrice,
           ARRAY_AGG(
             STRUCT(
-              pi.retailer_id,
-              pi.retailer_name,
-              pi.price,
+              pp.retailer_id,
+              pp.retailer_name,
+              pp.price,
               CASE
-                WHEN pi.is_available = TRUE THEN 'in_stock'
+                WHEN pp.is_available = TRUE THEN 'in_stock'
                 ELSE 'out_of_stock'
               END AS stockStatus,
               4.5 AS rating, -- Placeholder; would be from actual ratings table
-              FORMAT_DATE('%Y-%m-%d', pi.price_date) AS lastUpdated
+              FORMAT_DATE('%Y-%m-%d', pp.price_date) AS lastUpdated
             )
-            ORDER BY pi.price ASC
+            ORDER BY pp.price ASC
             LIMIT @limit
           ) AS retailerPrices,
           STRUCT(
-            COALESCE(ph.price_change, 0) AS priceChange,
-            COALESCE(ph.trend, 'stable') AS trend
+            0.0 AS priceChange,
+            'stable' AS trend
           ) AS priceHistory
         FROM
-          ProductInfo pi
-        JOIN
-          AvgPrices ap
-          ON pi.product_id = ap.product_id
+          BasicProductInfo bp
         LEFT JOIN
-          PriceHistory ph
-          ON pi.product_id = ph.product_id
+          ProductPrices pp
+          ON bp.product_id = pp.product_id
+        LEFT JOIN
+          AvgPrices ap
+          ON bp.product_id = ap.product_id
         GROUP BY
-          pi.product_id,
-          ap.avg_price,
-          ph.price_change,
-          ph.trend
+          bp.product_id,
+          bp.product_name,
+          bp.category_name,
+          ap.avg_price
         ORDER BY
           pi.product_id
         """
         
-        # Execute query
+        # Try a direct basic query first to confirm these product IDs exist
+        debug_query = f"""
+        SELECT match_group_id, COUNT(*) 
+        FROM `price-pulse-470211.warehouse.FactProductMatch`
+        WHERE match_group_id IN ({product_ids})
+        GROUP BY match_group_id
+        """
+        
+        debug_job = bq_client.query(debug_query)
+        debug_results = list(debug_job.result())
+        
+        if not debug_results:
+            # Product IDs don't exist in the database, return empty response
+            print(f"No products found with IDs: {product_ids}")
+            return {"success": True, "data": [], "timestamp": datetime.utcnow()}
+        
+        # Execute the main query
         query_job = bq_client.query(sql, job_config=job_config)
         results = query_job.result()
         
