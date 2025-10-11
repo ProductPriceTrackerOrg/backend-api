@@ -31,9 +31,9 @@ def get_new_arrivals(
     # Build WHERE clauses with proper filtering
     where_clauses = []
 
-    # Note: Category filtering is temporarily disabled as DimCategory table is not available
-    # if query.category and query.category.lower() not in ["null", "none", "", "all"]:
-    #    where_clauses.append(f"LOWER(c.category_name) LIKE LOWER('%{query.category}%')")
+    # Category filtering is now enabled - DimCategory table is available
+    if query.category and query.category.lower() not in ["null", "none", "", "all"]:
+        where_clauses.append(f"LOWER(c.category_name) LIKE LOWER('%{query.category}%')")
 
     # Handle retailer filtering
     if query.retailer and query.retailer.lower() not in ["null", "none", "", "all"]:
@@ -89,16 +89,9 @@ def get_new_arrivals(
             "NO STOCK FILTER: inStockOnly=None - showing ALL products (both in-stock and out-of-stock)"
         )
 
-    # Build final WHERE clause
-    base_where = """
-    fp.date_id = (
-        SELECT MAX(date_id) 
-        FROM `{}.{}.FactProductPrice` 
-        WHERE variant_id = v.variant_id
-    )
-    """.format(
-        settings.GCP_PROJECT_ID, settings.BIGQUERY_DATASET_ID
-    )
+    # Build final WHERE clause - using a more efficient approach with window functions
+    # Since we're filtering in the CTE now, we don't need an explicit is_latest check
+    base_where = "1=1"  # Always true condition as placeholder since filtering is done in the CTE
 
     if where_clauses:
         where_sql = " AND ".join(where_clauses) + f" AND {base_where}"
@@ -121,14 +114,49 @@ def get_new_arrivals(
     # Calculate pagination
     offset = (query.page - 1) * query.limit
 
-    # Main query for new arrivals
+    # Main query for new arrivals - optimized with window functions and materialized CTE
     main_sql = f"""
+    -- Using a WITH clause to pre-compute the latest prices once - major performance optimization
+    WITH latest_prices AS (
+      SELECT 
+        variant_id,
+        date_id,
+        current_price,
+        original_price,
+        is_available,
+        -- Add a flag for the latest price record - fixed syntax by separating the ROW_NUMBER calculation
+        ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY date_id DESC) as row_num
+      FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+    ),
+    
+    -- Filter to only the latest prices
+    filtered_prices AS (
+      SELECT
+        variant_id,
+        date_id,
+        current_price,
+        original_price,
+        is_available,
+        TRUE as is_latest
+      FROM latest_prices
+      WHERE row_num = 1
+    ),
+    -- Pre-materialize the product images to avoid complex subquery processing for each row
+    first_images AS (
+      SELECT 
+        shop_product_id, 
+        MIN(image_url) AS image_url
+      FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
+      GROUP BY shop_product_id
+    )
+    
+    -- Main query using pre-computed data
     SELECT
         v.variant_id,
         sp.shop_product_id,
         sp.product_title_native as product_title,
         COALESCE(sp.brand_native, 'Unknown Brand') as brand,
-        'Not Available' as category_name, -- Placeholder since DimCategory is not available
+        COALESCE(c.category_name, 'Uncategorized') as category_name,
         COALESCE(v.variant_title, sp.product_title_native) as variant_title,
         s.shop_name,
         fp.current_price,
@@ -145,20 +173,17 @@ def get_new_arrivals(
             ), 
             0
         ) as days_since_arrival
-    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
+    FROM filtered_prices fp
     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
         ON fp.variant_id = v.variant_id
     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
         ON v.shop_product_id = sp.shop_product_id
     JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
         ON sp.shop_id = s.shop_id
-    LEFT JOIN (
-        SELECT 
-            shop_product_id, 
-            image_url, 
-            ROW_NUMBER() OVER (PARTITION BY shop_product_id ORDER BY COALESCE(sort_order, 999)) as rn
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage`
-    ) pi ON sp.shop_product_id = pi.shop_product_id AND pi.rn = 1
+    LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
+        ON sp.predicted_master_category_id = c.category_id
+    LEFT JOIN first_images pi 
+        ON sp.shop_product_id = pi.shop_product_id
     WHERE {where_sql}
     ORDER BY {order_sql}
     LIMIT {query.limit} OFFSET {offset}
@@ -313,18 +338,44 @@ def get_new_arrivals(
             stats_where_sql = base_where
 
         stats_sql = f"""
+        -- Using a WITH clause to pre-compute the latest prices once - major performance optimization
+        WITH latest_prices AS (
+          SELECT 
+            variant_id,
+            date_id,
+            current_price,
+            original_price,
+            is_available,
+            ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY date_id DESC) as row_num
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+        ),
+        
+        -- Filter to only the latest prices
+        filtered_prices AS (
+          SELECT
+            variant_id,
+            date_id,
+            current_price,
+            original_price,
+            is_available
+          FROM latest_prices
+          WHERE row_num = 1
+        )
+        
         SELECT
             COUNT(DISTINCT v.variant_id) as total_new_arrivals,
             ROUND(AVG(fp.current_price), 2) as average_price,
             SUM(CASE WHEN fp.is_available = TRUE THEN 1 ELSE 0 END) as in_stock_count,
-            1 as category_count -- Placeholder since DimCategory is not available
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
+            COUNT(DISTINCT c.category_id) as category_count
+        FROM filtered_prices fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
             ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
+            ON sp.predicted_master_category_id = c.category_id
         WHERE {stats_where_sql}
         """
 
@@ -488,8 +539,26 @@ def check_database_stock_distribution(
     Special endpoint to check if database actually has out-of-stock items
     """
     try:
-        # Check the actual stock distribution in the database
+        # Check the actual stock distribution in the database - with optimized query
         stock_check_sql = f"""
+        WITH latest_prices AS (
+          SELECT 
+            variant_id,
+            date_id,
+            is_available,
+            ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY date_id DESC) as row_num
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+        ),
+        
+        filtered_prices AS (
+          SELECT
+            variant_id,
+            date_id,
+            is_available
+          FROM latest_prices
+          WHERE row_num = 1
+        )
+        
         SELECT 
             fp.is_available,
             COUNT(*) as count,
@@ -499,69 +568,98 @@ def check_database_stock_distribution(
                 WHEN fp.is_available IS NULL THEN 'NULL Value'
                 ELSE 'Other Value'
             END as status_description
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
+        FROM filtered_prices fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
-        WHERE fp.date_id = (
-            SELECT MAX(date_id) 
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
-            WHERE variant_id = v.variant_id
-        )
         GROUP BY fp.is_available
         ORDER BY fp.is_available DESC NULLS LAST
         """
 
         stock_distribution = list(bq_client.query(stock_check_sql).result())
 
-        # Get some sample out-of-stock items if they exist
+        # Get some sample out-of-stock items if they exist - using optimized query structure
         out_of_stock_sample_sql = f"""
+        WITH latest_prices AS (
+          SELECT 
+            variant_id,
+            date_id,
+            current_price,
+            is_available,
+            ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY date_id DESC) as row_num
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+        ),
+        
+        filtered_prices AS (
+          SELECT
+            variant_id,
+            date_id,
+            current_price,
+            is_available
+          FROM latest_prices
+          WHERE row_num = 1
+        )
+        
         SELECT 
             v.variant_id,
             sp.product_title_native,
             s.shop_name,
             fp.current_price,
             fp.is_available,
-            'Not Available' as category_name
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
+            COALESCE(c.category_name, 'Uncategorized') as category_name
+        FROM filtered_prices fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
             ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
-        WHERE fp.date_id = (
-            SELECT MAX(date_id) 
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
-            WHERE variant_id = v.variant_id
-        )
-        AND fp.is_available = FALSE
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
+            ON sp.predicted_master_category_id = c.category_id
+        WHERE fp.is_available = FALSE
         LIMIT 10
         """
 
         out_of_stock_samples = list(bq_client.query(out_of_stock_sample_sql).result())
 
-        # Get some sample in-stock items
+        # Get some sample in-stock items - using optimized query structure
         in_stock_sample_sql = f"""
+        WITH latest_prices AS (
+          SELECT 
+            variant_id,
+            date_id,
+            current_price,
+            is_available,
+            ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY date_id DESC) as row_num
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+        ),
+        
+        filtered_prices AS (
+          SELECT
+            variant_id,
+            date_id,
+            current_price,
+            is_available
+          FROM latest_prices
+          WHERE row_num = 1
+        )
+        
         SELECT 
             v.variant_id,
             sp.product_title_native,
             s.shop_name,
             fp.current_price,
             fp.is_available,
-            'Not Available' as category_name
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
+            COALESCE(c.category_name, 'Uncategorized') as category_name
+        FROM filtered_prices fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
             ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
-        WHERE fp.date_id = (
-            SELECT MAX(date_id) 
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
-            WHERE variant_id = v.variant_id
-        )
-        AND fp.is_available = TRUE
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
+            ON sp.predicted_master_category_id = c.category_id
+        WHERE fp.is_available = TRUE
         LIMIT 5
         """
 
@@ -611,32 +709,49 @@ def debug_new_arrivals(bq_client: bigquery.Client = Depends(get_bigquery_client)
             except Exception as e:
                 results[table] = f"Error: {str(e)}"
 
-        # Check sample data with stock status
+        # Check sample data with stock status - using optimized query structure
         sample_sql = f"""
+        WITH latest_prices AS (
+          SELECT 
+            variant_id,
+            date_id,
+            current_price,
+            is_available,
+            ROW_NUMBER() OVER (PARTITION BY variant_id ORDER BY date_id DESC) as row_num
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+        ),
+        
+        filtered_prices AS (
+          SELECT
+            variant_id,
+            date_id,
+            current_price,
+            is_available
+          FROM latest_prices
+          WHERE row_num = 1
+        )
+        
         SELECT 
             v.variant_id,
             sp.product_title_native,
             s.shop_name,
             fp.current_price,
             fp.is_available,
-            'Not Available' as category_name,
+            COALESCE(c.category_name, 'Uncategorized') as category_name,
             CASE 
                 WHEN fp.is_available = TRUE THEN 'In Stock' 
                 WHEN fp.is_available = FALSE THEN 'Out of Stock'
                 ELSE 'Unknown Status'
             END as stock_status_text
-        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fp
+        FROM filtered_prices fp
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
             ON fp.variant_id = v.variant_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp 
             ON v.shop_product_id = sp.shop_product_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
             ON sp.shop_id = s.shop_id
-        WHERE fp.date_id = (
-            SELECT MAX(date_id) 
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` 
-            WHERE variant_id = v.variant_id
-        )
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
+            ON sp.predicted_master_category_id = c.category_id
         ORDER BY fp.is_available DESC, v.variant_id
         LIMIT 20
         """
