@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Query, Depends, HTTPException
 from typing import Literal, Optional
+from datetime import timedelta
 from app.schemas.analytics.category_insights import CategoryInsightsResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
@@ -34,8 +35,11 @@ async def get_category_insights(
     """
     Get insights and performance metrics for product categories.
     
+    Uses the most recent date with available data to ensure consistency across all analyses.
+    Price changes are calculated by comparing with historical data from the specified time range.
+    
     - **time_range**: The time period for analysis (7d, 30d, 90d, 1y)
-    - **retailer**: Shop ID or "all"
+    - **retailer**: Shop ID or name, or "all" for all retailers
     """
     try:
         # Build query with the appropriate filters
@@ -53,15 +57,21 @@ async def get_category_insights(
         
         # SQL query for category insights
         query = f"""
-                WITH today_date AS (
+                WITH latest_available_date AS (
+                -- Find the most recent date with data in FactProductPrice
+                SELECT MAX(dd.date_id) as date_id, MAX(dd.full_date) as full_date
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON pp.date_id = dd.date_id
+                ),
+                today_date AS (
                 SELECT date_id
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate`
-                WHERE full_date = CURRENT_DATE()
+                FROM latest_available_date
                 ),
                 historical_date AS (
-                SELECT date_id
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate`
-                WHERE full_date = DATE_SUB(CURRENT_DATE(), INTERVAL {time_range_value} DAY)
+                SELECT dd.date_id
+                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd
+                JOIN latest_available_date lad
+                ON dd.full_date = DATE_SUB(lad.full_date, INTERVAL {time_range_value} DAY)
                 ),
                 category_stats AS (
                 SELECT
@@ -69,12 +79,19 @@ async def get_category_insights(
                     c.category_name,
                     COUNT(DISTINCT v.variant_id) as product_count,
                     AVG(current_pp.current_price) as current_avg_price,
+                    -- Fix division by zero in price change calculation
                     AVG(
-                    CASE WHEN historical_pp.current_price IS NOT NULL
-                    THEN (current_pp.current_price - historical_pp.current_price) / historical_pp.current_price * 100
-                    ELSE 0 END
+                    CASE 
+                      WHEN historical_pp.current_price IS NOT NULL AND historical_pp.current_price > 0
+                      THEN (current_pp.current_price - historical_pp.current_price) / historical_pp.current_price * 100
+                      ELSE 0 
+                    END
                     ) as price_change_pct,
-                    STDDEV(daily_pp.current_price) / AVG(daily_pp.current_price) as price_volatility,
+                    -- Fix division by zero in volatility calculation
+                    SAFE_DIVIDE(
+                      STDDEV(daily_pp.current_price), 
+                      NULLIF(AVG(daily_pp.current_price), 0)
+                    ) as price_volatility,
                     COUNT(CASE WHEN current_pp.current_price < historical_pp.current_price THEN 1 END) as deal_count
                 FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
                 JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
@@ -95,7 +112,8 @@ async def get_category_insights(
                     ON v.variant_id = daily_pp.variant_id
                 JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d
                     ON daily_pp.date_id = d.date_id
-                AND d.full_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL {time_range_value} DAY) AND CURRENT_DATE()
+                JOIN latest_available_date lad2 ON 1=1
+                AND d.full_date BETWEEN DATE_SUB(lad2.full_date, INTERVAL {time_range_value} DAY) AND lad2.full_date
                 WHERE current_pp.is_available = TRUE
                     AND {retailer_filter}
                 GROUP BY c.category_id, c.category_name
@@ -115,6 +133,21 @@ async def get_category_insights(
         # Execute query
         query_job = bq_client.query(query)
         results = list(query_job.result())
+        
+        # Get the date that was used for analysis (for logging)
+        date_query = f"""
+        WITH latest_available_date AS (
+          SELECT MAX(dd.date_id) as date_id, MAX(dd.full_date) as full_date
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON pp.date_id = dd.date_id
+        )
+        SELECT full_date FROM latest_available_date
+        """
+        date_result = list(bq_client.query(date_query).result())
+        if date_result and hasattr(date_result[0], 'full_date'):
+            print(f"Category insights using data from: {date_result[0].full_date}")
+            historical_date = date_result[0].full_date - timedelta(days=time_range_value)
+            print(f"Historical comparison date: {historical_date}")
         
         # Transform into response format
         insights = [

@@ -34,6 +34,8 @@ async def get_shop_comparison(
     """
     Get comparison data for retailers/shops.
     
+    Uses the most recent date with available data to ensure consistency across all retailers.
+    
     - **category**: Category ID or "all"
     - **time_range**: The time period for analysis (7d, 30d, 90d, 1y)
     """
@@ -55,10 +57,11 @@ async def get_shop_comparison(
         
         # SQL query for shop comparison
         query = f"""
-        WITH today_date AS (
-          SELECT date_id 
-          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` 
-          WHERE full_date = CURRENT_DATE()
+        WITH latest_available_date AS (
+          -- Find the most recent date with data in FactProductPrice
+          SELECT MAX(dd.date_id) as date_id, MAX(dd.full_date) as full_date
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON pp.date_id = dd.date_id
         ),
         shop_products AS (
           SELECT 
@@ -71,9 +74,9 @@ async def get_shop_comparison(
           JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON s.shop_id = sp.shop_id
           {'JOIN `' + settings.GCP_PROJECT_ID + '.' + settings.BIGQUERY_DATASET_ID + '.DimCategory` c ON sp.predicted_master_category_id = c.category_id' if not category.isdigit() and category != 'all' else ''}
           JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-          JOIN today_date td ON 1=1
+          JOIN latest_available_date lad ON 1=1
           JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
-            ON v.variant_id = pp.variant_id AND pp.date_id = td.date_id
+            ON v.variant_id = pp.variant_id AND pp.date_id = lad.date_id
           WHERE {category_filter}
         ),
         avg_market_prices AS (
@@ -111,8 +114,9 @@ async def get_shop_comparison(
           FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s
           JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON s.shop_id = sp.shop_id
           JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id
+          JOIN latest_available_date lad ON 1=1
           WHERE
-            sp.scraped_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {time_range_value} DAY)
+            sp.scraped_date >= DATE_SUB(lad.full_date, INTERVAL {time_range_value} DAY)
           GROUP BY s.shop_id, c.category_name
         ),
         top_categories AS (
@@ -151,6 +155,19 @@ async def get_shop_comparison(
         # Execute query
         query_job = bq_client.query(query)
         results = list(query_job.result())
+        
+        # First, get the date that was used for comparison (for logging)
+        date_query = f"""
+        WITH latest_available_date AS (
+          SELECT MAX(dd.date_id) as date_id, MAX(dd.full_date) as full_date
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON pp.date_id = dd.date_id
+        )
+        SELECT full_date FROM latest_available_date
+        """
+        date_result = list(bq_client.query(date_query).result())
+        if date_result and hasattr(date_result[0], 'full_date'):
+            print(f"Shop comparison using data from: {date_result[0].full_date}")
         
         # Transform into response format
         insights = []

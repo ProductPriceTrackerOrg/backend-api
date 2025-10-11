@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Query, Depends, HTTPException
 from typing import Literal, Optional, List
+from datetime import timedelta
 from app.schemas.analytics.price_alerts import PriceAlertsResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
@@ -98,7 +99,7 @@ async def get_price_alerts(
             COALESCE(img.image_url, '/placeholder.jpg') as image_url,
             historical_pp.current_price as original_price,
             current_pp.current_price as current_price,
-            ((current_pp.current_price - historical_pp.current_price) / historical_pp.current_price) * 100 as percentage_change,
+            ((current_pp.current_price - historical_pp.current_price) / NULLIF(historical_pp.current_price, 0)) * 100 as percentage_change,
             s.shop_name,
             FORMAT_TIMESTAMP('%Y-%m-%d', ra.detected_date) as detected_date,
             CONCAT('/product/', CAST(sp.shop_product_id AS STRING)) as product_url,
@@ -112,20 +113,34 @@ async def get_price_alerts(
           JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON ra.shop_product_id = sp.shop_product_id
           JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
           LEFT JOIN product_images img ON sp.shop_product_id = img.shop_product_id AND img.row_num = 1
+          -- Find the latest date with price data
           JOIN (
+            WITH LatestAvailableDate AS (
+              SELECT MAX(d.date_id) as latest_date_id, MAX(d.full_date) as latest_date
+              FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+              JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+            )
             SELECT pp.*
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d
-              ON pp.date_id = d.date_id
-            WHERE d.full_date = CURRENT_DATE()
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+            JOIN LatestAvailableDate lad ON d.date_id = lad.latest_date_id
           ) current_pp
             ON ra.variant_id = current_pp.variant_id
+          -- Get historical price data from 14 days before the latest date
           JOIN (
+            WITH LatestAvailableDate AS (
+              SELECT MAX(d.date_id) as latest_date_id, MAX(d.full_date) as latest_date
+              FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+              JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+            ),
+            HistoricalDate AS (
+              SELECT MAX(d.date_id) as historical_date_id
+              FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d
+              JOIN LatestAvailableDate lad ON d.full_date = DATE_SUB(lad.latest_date, INTERVAL 14 DAY)
+            )
             SELECT pp.*
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d
-              ON pp.date_id = d.date_id
-            WHERE d.full_date = DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+            JOIN HistoricalDate hd ON pp.date_id = hd.historical_date_id
           ) historical_pp
             ON ra.variant_id = historical_pp.variant_id
           WHERE current_pp.is_available = TRUE
@@ -149,6 +164,21 @@ async def get_price_alerts(
         # Execute query
         query_job = bq_client.query(query)
         results = list(query_job.result())
+        
+        # Get the date that was used for analysis (for logging)
+        date_query = f"""
+        WITH LatestAvailableDate AS (
+          SELECT MAX(d.date_id) as latest_date_id, MAX(d.full_date) as latest_date
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+        )
+        SELECT latest_date FROM LatestAvailableDate
+        """
+        date_result = list(bq_client.query(date_query).result())
+        if date_result and hasattr(date_result[0], 'latest_date'):
+            print(f"Price alerts using data from: {date_result[0].latest_date}")
+            historical_date = date_result[0].latest_date - timedelta(days=14)  # 14 days back
+            print(f"Historical comparison date: {historical_date}")
         
         # Transform into response format
         alerts = []
