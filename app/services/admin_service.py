@@ -7,6 +7,7 @@ from google.cloud import bigquery
 from app.config import settings
 from google.api_core.exceptions import GoogleAPICallError
 from app.services.user_service import get_total_users_count
+from app.db.supabase_client  import get_supabase_client
 from typing import Dict, Any, List
 from datetime import date, timedelta
 
@@ -189,5 +190,68 @@ def get_category_distribution(bq_client: bigquery.Client, start_date: date, end_
 
     except (GoogleAPICallError, Exception) as e:
         print(f"An error occurred while fetching category distribution: {e}")
+        return [{"error": str(e)}]
+
+
+# Top Tracked Products Chart
+def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetches the top 10 most tracked products by users within a date range.
+    """
+    try:
+        # Step 1: Query Supabase to get the top 10 variant IDs and their favorite counts
+        supabase = get_supabase_client()
+        
+        rpc_params = {'start_date_param': str(start_date), 'end_date_param': str(end_date)}
+        top_variants_response = supabase.rpc('get_top_tracked_products', rpc_params).execute()
+        
+        top_variants_data = top_variants_response.data
+        if not top_variants_data:
+            return []
+
+        # Extract just the variant IDs to use in the BigQuery query
+        variant_ids = [item['variant_id_result'] for item in top_variants_data]
+        
+        # Create a mapping of variant_id to user_count for later joining
+        user_counts = {item['variant_id_result']: item['user_count_result'] for item in top_variants_data}
+
+        # Step 2: Query BigQuery to get the product names for those variant IDs
+        if not bq_client: raise Exception("BigQuery client not provided.")
+
+        query = f"""
+            SELECT
+                v.variant_id,
+                p.product_title_native AS productName
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS p
+                ON v.shop_product_id = p.shop_product_id
+            WHERE v.variant_id IN UNNEST(@variant_ids)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("variant_ids", "INT64", variant_ids),
+            ]
+        )
+        product_names_df = bq_client.query(query, job_config=job_config).to_dataframe()
+
+        if product_names_df.empty:
+            return []
+
+        # Step 3: Combine the results in Python
+        # Add the 'userCount' to our DataFrame of product names
+        product_names_df['userCount'] = product_names_df['variant_id'].map(user_counts)
+        
+        # Drop the variant_id as it's not needed by the frontend
+        final_df = product_names_df.drop(columns=['variant_id'])
+        
+        # Sort by userCount descending to ensure the chart is ordered correctly
+        final_df = final_df.sort_values('userCount', ascending=False)
+        
+        # Sanitize data to prevent JSON errors
+        final_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        return final_df.where(pd.notna(final_df), None).to_dict('records')
+
+    except (GoogleAPICallError, Exception) as e:
+        print(f"An error occurred while fetching top tracked products: {e}")
         return [{"error": str(e)}]
 

@@ -126,3 +126,24 @@ async def get_category_distribution_analytics(
         
     return category_data
 
+
+@router.get("/analytics/top-tracked-products")
+async def get_top_tracked_products_analytics(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    days: int = 30,
+    bq_client: bigquery.Client = Depends(get_bigquery_client)
+):
+    """
+    Fetches the top 10 most tracked products for the analytics bar chart.
+    """
+    if start_date is None or end_date is None:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days - 1)
+    
+    top_products_data = admin_service.get_top_tracked_products(bq_client, start_date, end_date)
+    
+    if isinstance(top_products_data, list) and top_products_data and "error" in top_products_data[0]:
+        raise HTTPException(status_code=500, detail=top_products_data[0]["error"])
+        
+    return top_products_data
