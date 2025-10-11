@@ -4,9 +4,11 @@ from google.cloud import bigquery
 import supabase
 import logging
 import datetime
+import asyncio
 from app.config import settings
 from app.api.deps import get_current_user, get_current_admin_user, get_bigquery_client
 from app.services.cache_service import cache_service
+from app.services.async_query_service import async_query_service
 from app.schemas.home import (
     HomeStats, 
     CategoriesResponse, 
@@ -966,21 +968,19 @@ async def get_personalized_recommendations(
     cached_data = cache_service.get(cache_key)
     if cached_data:
         return cached_data
+        
+    # Fallback data in case of timeout or error
+    fallback_data = {
+        "recommended_products": [
+            # Add some default product recommendations here
+            # These could be popular products or placeholder data
+        ]
+    }
     
     try:
-        # Prepare query parameters
-        query_params = [
-            bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
-            bigquery.ScalarQueryParameter("limit", "INT64", limit)
-        ]
-        
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=query_params
-        )
-        
         # Optimized BigQuery query to get personalized recommendations
         # Using CTEs for better readability and performance
-        query = f"""
+        personalized_query = f"""
         WITH 
         -- Get the most recent date_id for price data
         LatestDate AS (
@@ -1000,7 +1000,7 @@ async def get_personalized_recommendations(
                     ELSE 'Recommended for you'
                 END AS recommendation_reason
             FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPersonalizedRecommendation` AS fpr
-            WHERE fpr.user_id = @user_id
+            WHERE fpr.user_id = '{user_id}'
             ORDER BY fpr.recommendation_score DESC
             LIMIT 100 -- Get more than needed to ensure we have enough after filtering
         ),
@@ -1056,109 +1056,120 @@ async def get_personalized_recommendations(
         FROM ProductRecommendations
         WHERE row_num = 1
         ORDER BY recommendation_score DESC
-        LIMIT @limit
+        LIMIT {limit}
         """
         
-        # Execute the query with the config
-        query_job = bq_client.query(query, job_config=job_config)
-        results = query_job.result()
+        # Fallback query for popular products if personalized recommendations are not found
+        popular_query = f"""
+        WITH LatestDate AS (
+            SELECT MAX(date_id) AS max_date_id 
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+        ),
         
-        # Process results
-        recommended_products = []
-        for row in results:
-            recommended_products.append({
-                "id": row.id,
-                "name": row.name,
-                "brand": row.brand,
-                "category": row.category,
-                "price": row.price,
-                "original_price": row.original_price,
-                "retailer": row.retailer,
-                "image": row.image,
-                "recommendation_score": row.recommendation_score,
-                "recommendation_reason": row.recommendation_reason
-            })
+        -- Get popular products with all their details
+        PopularProducts AS (
+            SELECT 
+                sp.shop_product_id AS id,
+                sp.product_title_native AS name,
+                COALESCE(sp.brand_native, 'Unknown') AS brand,
+                COALESCE(c.category_name, 'Uncategorized') AS category,
+                fpp.current_price AS price,
+                fpp.original_price,
+                s.shop_name AS retailer,
+                pi.image_url AS image,
+                0.8 AS recommendation_score,
+                'Popular product' AS recommendation_reason,
+                -- Use row number to select one variant per product
+                ROW_NUMBER() OVER (
+                    PARTITION BY sp.shop_product_id 
+                    ORDER BY fpp.current_price ASC
+                ) as row_num
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
+                ON sp.shop_product_id = v.shop_product_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
+                ON sp.shop_id = s.shop_id
+            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
+                ON sp.predicted_master_category_id = c.category_id
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp 
+                ON v.variant_id = fpp.variant_id
+            JOIN LatestDate ld 
+            ON fpp.date_id = ld.max_date_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi 
+            ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
+        WHERE fpp.is_available = TRUE
+        )
         
-        # If no personalized recommendations found, return popular products as fallback
-        if not recommended_products:
-            # Fallback query for popular products
-            fallback_query = f"""
-            WITH LatestDate AS (
-                SELECT MAX(date_id) AS max_date_id 
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
-            ),
-            
-            -- Get popular products with all their details
-            PopularProducts AS (
-                SELECT 
-                    sp.shop_product_id AS id,
-                    sp.product_title_native AS name,
-                    COALESCE(sp.brand_native, 'Unknown') AS brand,
-                    COALESCE(c.category_name, 'Uncategorized') AS category,
-                    fpp.current_price AS price,
-                    fpp.original_price,
-                    s.shop_name AS retailer,
-                    pi.image_url AS image,
-                    0.8 AS recommendation_score,
-                    'Popular product' AS recommendation_reason,
-                    -- Use row number to select one variant per product
-                    ROW_NUMBER() OVER (
-                        PARTITION BY sp.shop_product_id 
-                        ORDER BY fpp.current_price ASC
-                    ) as row_num
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v 
-                    ON sp.shop_product_id = v.shop_product_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s 
-                    ON sp.shop_id = s.shop_id
-                LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c 
-                    ON sp.predicted_master_category_id = c.category_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp 
-                    ON v.variant_id = fpp.variant_id
-                JOIN LatestDate ld 
-                ON fpp.date_id = ld.max_date_id
-            LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimProductImage` pi 
-                ON sp.shop_product_id = pi.shop_product_id AND pi.sort_order = 1
-            WHERE fpp.is_available = TRUE
-            )
-            
-            -- Select only one variant per product (the one with lowest price)
-            SELECT
-                id,
-                name,
-                brand,
-                category,
-                price,
-                original_price,
-                retailer,
-                image,
-                recommendation_score,
-                recommendation_reason
-            FROM PopularProducts
-            WHERE row_num = 1
-            ORDER BY price DESC
-            LIMIT @limit
-            """
-            
-            fallback_job = bq_client.query(fallback_query, job_config=job_config)
-            fallback_results = fallback_job.result()
-            
-            for row in fallback_results:
-                recommended_products.append({
-                    "id": row.id,
-                    "name": row.name,
-                    "brand": row.brand,
-                    "category": row.category,
-                    "price": row.price,
-                    "original_price": row.original_price,
-                    "retailer": row.retailer,
-                    "image": row.image,
-                    "recommendation_score": row.recommendation_score,
-                    "recommendation_reason": row.recommendation_reason
+        -- Select only one variant per product (the one with lowest price)
+        SELECT
+            id,
+            name,
+            brand,
+            category,
+            price,
+            original_price,
+            retailer,
+            image,
+            recommendation_score,
+            recommendation_reason
+        FROM PopularProducts
+        WHERE row_num = 1
+        ORDER BY price DESC
+        LIMIT {limit}
+        """
+        
+        # Define transformation function to process query results
+        def transform_results(results):
+            products = []
+            for row in results:
+                products.append({
+                    "id": row.get("id"),
+                    "name": row.get("name"),
+                    "brand": row.get("brand"),
+                    "category": row.get("category"),
+                    "price": row.get("price"),
+                    "original_price": row.get("original_price"),
+                    "retailer": row.get("retailer"),
+                    "image": row.get("image"),
+                    "recommendation_score": row.get("recommendation_score"),
+                    "recommendation_reason": row.get("recommendation_reason")
                 })
+            return {"recommended_products": products}
         
-        # Prepare the response
-        response_data = {"recommended_products": recommended_products}
+        # Execute both queries concurrently with a timeout
+        query_configs = [
+            {
+                "query": personalized_query,
+                "result_key": "personalized",
+                "cache_key": None,  # Don't cache intermediate results
+                "timeout": 10,  # 10 second timeout for this query
+                "fallback_data": None,
+                "transform_func": None
+            },
+            {
+                "query": popular_query,
+                "result_key": "popular",
+                "cache_key": None,
+                "timeout": 10,
+                "fallback_data": None,
+                "transform_func": None
+            }
+        ]
+        
+        # Execute both queries in parallel
+        results = await async_query_service.execute_queries_parallel(bq_client, query_configs)
+        
+        # Process the results
+        personalized_results = results.get("personalized", [])
+        popular_results = results.get("popular", [])
+        
+        # If we have personalized results, use those; otherwise, use popular products
+        if personalized_results and len(personalized_results) > 0:
+            response_data = transform_results(personalized_results)
+        elif popular_results and len(popular_results) > 0:
+            response_data = transform_results(popular_results)
+        else:
+            response_data = fallback_data
         
         # Cache the results for 1 hour
         cache_service.set(cache_key, response_data, ttl_seconds=3600)
@@ -1166,7 +1177,6 @@ async def get_personalized_recommendations(
         return response_data
         
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while querying BigQuery: {e}"
-        )
+        logger.error(f"Error in get_personalized_recommendations: {str(e)}")
+        # Return cached data if available, or fallback data
+        return fallback_data

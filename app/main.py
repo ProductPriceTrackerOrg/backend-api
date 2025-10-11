@@ -105,6 +105,10 @@ app.include_router(retailers.router, prefix="/api/v1/retailers", tags=["Retailer
 from app.api.v1 import analytics
 
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
+# Include the price drops routes
+from app.api.v1 import price_drops
+
+app.include_router(price_drops.router, prefix="/api/v1", tags=["Price Drops"])
 
 from app.api.v1 import buyer_central
 
