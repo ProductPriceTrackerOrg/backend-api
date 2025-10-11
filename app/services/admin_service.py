@@ -197,39 +197,39 @@ def get_category_distribution(bq_client: bigquery.Client, start_date: date, end_
 def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_date: date) -> List[Dict[str, Any]]:
     """
     Fetches the top 10 most tracked products by users within a date range.
+    This version correctly joins Supabase 'variant_id' with BigQuery 'shop_product_id'.
     """
     try:
-        # Step 1: Query Supabase to get the top 10 variant IDs and their favorite counts
+        # Step 1: Query Supabase to get the top 10 product IDs and their favorite counts
         supabase = get_supabase_client()
         
         rpc_params = {'start_date_param': str(start_date), 'end_date_param': str(end_date)}
-        top_variants_response = supabase.rpc('get_top_tracked_products', rpc_params).execute()
+        top_products_response = supabase.rpc('get_top_tracked_products', rpc_params).execute()
         
-        top_variants_data = top_variants_response.data
-        if not top_variants_data:
+        top_products_data = top_products_response.data
+        if not top_products_data:
             return []
 
-        # Extract just the variant IDs to use in the BigQuery query
-        variant_ids = [item['variant_id_result'] for item in top_variants_data]
+        # Extract the shop_product_ids to use in the BigQuery query
+        shop_product_ids = [item['shop_product_id_result'] for item in top_products_data]
         
-        # Create a mapping of variant_id to user_count for later joining
-        user_counts = {item['variant_id_result']: item['user_count_result'] for item in top_variants_data}
+        # Create a mapping of shop_product_id to user_count for later joining
+        user_counts = {item['shop_product_id_result']: item['user_count_result'] for item in top_products_data}
 
-        # Step 2: Query BigQuery to get the product names for those variant IDs
+        # Step 2: Query BigQuery to get the product names for those shop_product_ids
         if not bq_client: raise Exception("BigQuery client not provided.")
 
+        # This query is now much simpler and correct.
         query = f"""
             SELECT
-                v.variant_id,
+                p.shop_product_id,
                 p.product_title_native AS productName
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS v
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS p
-                ON v.shop_product_id = p.shop_product_id
-            WHERE v.variant_id IN UNNEST(@variant_ids)
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS p
+            WHERE p.shop_product_id IN UNNEST(@shop_product_ids)
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ArrayQueryParameter("variant_ids", "INT64", variant_ids),
+                bigquery.ArrayQueryParameter("shop_product_ids", "INT64", shop_product_ids),
             ]
         )
         product_names_df = bq_client.query(query, job_config=job_config).to_dataframe()
@@ -239,10 +239,10 @@ def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_d
 
         # Step 3: Combine the results in Python
         # Add the 'userCount' to our DataFrame of product names
-        product_names_df['userCount'] = product_names_df['variant_id'].map(user_counts)
+        product_names_df['userCount'] = product_names_df['shop_product_id'].map(user_counts)
         
-        # Drop the variant_id as it's not needed by the frontend
-        final_df = product_names_df.drop(columns=['variant_id'])
+        # Drop the shop_product_id as it's not needed by the frontend
+        final_df = product_names_df.drop(columns=['shop_product_id'])
         
         # Sort by userCount descending to ensure the chart is ordered correctly
         final_df = final_df.sort_values('userCount', ascending=False)
