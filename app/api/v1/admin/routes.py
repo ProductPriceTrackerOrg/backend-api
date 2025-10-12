@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from google.cloud import bigquery
 from .dependencies import get_current_admin_user
-from app.services import admin_service, user_service
+from app.services import admin_service, user_service, audit_service
 from app.api.deps import get_bigquery_client
 from pydantic import BaseModel
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from datetime import date, timedelta
 
 # All routes in this file will have the prefix /admin
@@ -15,6 +15,24 @@ router = APIRouter(
     dependencies=[Depends(get_current_admin_user)]
 )
 
+
+# Pydantic model for the response of the user list
+class User(BaseModel):
+    user_id: str
+    email: str
+    full_name: str
+    is_active: bool
+
+class UserListResponse(BaseModel):
+    users: List[User]
+    total: int
+
+
+# Pydantic model for the request body of the status update
+class UserStatusUpdate(BaseModel):
+    is_active: bool   
+    
+    
 # Dashboard stats fetching end point
 @router.get("/dashboard-stats")
 async def get_dashboard_stats(bq_client: bigquery.Client = Depends(get_bigquery_client)):
@@ -147,3 +165,65 @@ async def get_top_tracked_products_analytics(
         raise HTTPException(status_code=500, detail=top_products_data[0]["error"])
         
     return top_products_data
+
+
+# End point for getting users list
+@router.get("/users", response_model=UserListResponse)
+async def get_users_list(
+    search: Optional[str] = None,
+    status: Optional[str] = Query(None, pattern="^(active|inactive)$"),
+    page: int = 1,
+    per_page: int = 10
+):
+    """
+    Fetches a paginated and searchable list of all users.
+    """
+    is_active_filter = None
+    if status == "active":
+        is_active_filter = True
+    elif status == "inactive":
+        is_active_filter = False
+        
+    result = user_service.get_users(
+        search=search,
+        is_active=is_active_filter,
+        page=page,
+        per_page=per_page
+    )
+    
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+        
+    return result
+
+
+# End point for updating the status of a user
+@router.put("/users/{user_id}/status")
+async def update_user_status_endpoint(
+    user_id: str,
+    status_update: UserStatusUpdate,
+    admin_user: Dict = Depends(get_current_admin_user)
+):
+    """
+    Updates a user's active status.
+    """
+    result = user_service.update_user_status(user_id=user_id, is_active=status_update.is_active)
+    
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+    
+    # --- Log this action to our audit trail ---
+    # We now call the log_admin_action function with the structured arguments it expects.
+    admin_id = admin_user.get("sub") # The 'sub' field in a JWT is the user's UUID
+    new_status_str = "active" if status_update.is_active else "inactive"
+    
+    audit_service.log_admin_action(
+        admin_user_id=admin_id,
+        action_type='UPDATE_USER_STATUS',
+        target_entity_type='USER',
+        target_entity_id=user_id,
+        details={'new_status': new_status_str}
+    )
+    
+    return {"status": "success", "message": f"User {user_id} status updated successfully."}
+

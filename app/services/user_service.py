@@ -78,7 +78,7 @@ def get_user_statistics() -> Dict[str, Any]:
         }
         
 
-# --- NEW FUNCTION for User Sign-ups Chart ---
+# Function for User Sign-ups Chart 
 def get_user_signups_over_time(start_date: date, end_date: date) -> List[Dict[str, Any]]:
     """
     Fetches the number of user sign-ups per day over a given date range.
@@ -127,4 +127,81 @@ def get_user_signups_over_time(start_date: date, end_date: date) -> List[Dict[st
 #     ORDER BY DATE(created_at);
 # END;
 # $$ LANGUAGE plpgsql;
+
+
+
+# Function Get User List for User Management 
+def get_users(search: Optional[str], is_active: Optional[bool], page: int, per_page: int) -> Dict[str, Any]:
+    """
+    Fetches a paginated list of users from the profiles table, 
+    with optional search and status filters.
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Start building the query. We select all columns needed by the UI.
+        query = supabase.table('profiles').select(
+            'user_id, email, full_name, is_active',
+            count='exact' # This tells Supabase to return the total count for pagination
+        )
+        
+        # Apply search filter if a search term is provided.
+        # It searches case-insensitively across 'full_name' and 'email'.
+        if search:
+            query = query.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%")
+            
+        # Apply status filter if 'active' or 'inactive' is specified.
+        if is_active is not None:
+            query = query.eq('is_active', is_active)
+            
+        # Apply pagination to fetch only the data for the current page.
+        offset = (page - 1) * per_page
+        query = query.range(offset, offset + per_page - 1).order('created_at', desc=True)
+        
+        # Execute the final query.
+        response = query.execute()
+        
+        # Some users might have a null 'full_name'. The API model expects a string.
+        # We'll replace any None values with an empty string to prevent validation errors.
+        cleaned_users = []
+        for user in response.data:
+            if user.get('full_name') is None:
+                user['full_name'] = ""
+            cleaned_users.append(user)
+
+        # Return the cleaned data in the format expected by the frontend.
+        return {
+            "users": cleaned_users,
+            "total": response.count
+        }
+        
+
+    except Exception as e:
+        logger.error(f"Error fetching users list from Supabase: {e}")
+        return {"error": str(e)}
+
+# Function for Update a User's Status
+def update_user_status(user_id: str, is_active: bool) -> Dict[str, Any]:
+    """
+    Updates the is_active status for a specific user in the profiles table.
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Perform the update operation on the 'profiles' table for the specified user_id.
+        # We also select the 'email' of the updated record, which is useful for audit logging.
+        response = supabase.table('profiles').update(
+            {'is_active': is_active}
+        ).eq('user_id', user_id).execute()
+        
+        # If the query didn't find a user with that ID, the data list will be empty.
+        if not response.data:
+            return {"error": f"User with ID {user_id} not found."}
+            
+        # Return the email of the updated user so the route can create a more descriptive log.
+        return {"email": response.data[0]['email']}
+
+    except Exception as e:
+        logger.error(f"Error updating user status for {user_id}: {e}")
+        return {"error": str(e)}
 
