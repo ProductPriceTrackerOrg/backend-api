@@ -721,7 +721,17 @@ async def get_similar_products(
             fallback_job = bq_client.query(fallback_query, job_config=job_config)
             results = [dict(row) for row in fallback_job.result()]
         
-        # Format the similar products
+        # Process the similar products to handle null values
+        for product in results:
+            # Handle null brand values
+            if product.get('brand') is None:
+                product['brand'] = 'Unknown Brand'
+                
+            # Ensure all required text fields are not null
+            for field in ['name', 'category', 'retailer']:
+                if product.get(field) is None:
+                    product[field] = ''
+        
         result = {"similar_products": results}
         
         # Cache the result

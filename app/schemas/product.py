@@ -100,7 +100,7 @@ class SimilarProduct(BaseModel):
     """A similar product recommendation"""
     id: int
     name: str
-    brand: str
+    brand: Optional[str] = "Unknown Brand"
     category: str
     price: float
     original_price: Optional[float] = None
