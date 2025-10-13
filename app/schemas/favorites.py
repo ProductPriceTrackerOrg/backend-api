@@ -25,3 +25,9 @@ class FavoriteProduct(BaseModel):
 class FavoritesResponse(BaseModel):
     """Response for the get user favorites endpoint"""
     favorites: List[FavoriteProduct]
+
+# --- Favorite Response ---
+class FavoriteResponse(BaseModel):
+    """Response for the favorite endpoints"""
+    is_favorited: bool
+    message: str

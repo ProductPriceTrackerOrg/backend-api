@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status, Path
 from typing import Dict, List, Optional, Any
 import logging
 from google.cloud import bigquery
 import supabase
 
+
 from app.config import settings
 from app.api.deps import get_current_user, get_bigquery_client
 from app.services.cache_service import cache_service
-from app.schemas.favorites import FavoritesResponse, FavoriteProduct
+from app.schemas.favorites import FavoritesResponse, FavoriteProduct, FavoriteResponse
 
 router = APIRouter()
 
@@ -150,4 +151,64 @@ async def get_user_favorites(
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred while retrieving favorites: {e}"
+        )
+
+@router.delete("/{product_id}/favorite", response_model=FavoriteResponse)
+async def remove_from_favorites(
+    product_id: int = Path(..., description="The ID of the product to unfavorite"),
+    current_user: Dict = Depends(get_current_user),
+    bq_client: bigquery.Client = Depends(get_bigquery_client),
+    supabase_client = Depends(get_supabase_client)
+) -> Dict:
+    """
+    Remove a product from the user's favorites.
+    
+    Requires authentication.
+    """
+    try:
+        user_id = current_user.get("sub")
+        if not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required"
+            )
+        
+        # First, get the variant ID for this product
+        variant_query = f"""
+        SELECT v.variant_id
+        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
+        WHERE sp.shop_product_id = {product_id}
+        """
+        
+        variant_job = bq_client.query(variant_query)
+        variant_results = list(variant_job.result())
+        
+        if not variant_results:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Product with ID {product_id} not found"
+            )
+        
+        # Get all variant IDs for this product
+        variant_ids = [row["variant_id"] for row in variant_results]
+        
+        # Remove from favorites
+        delete_response = supabase_client.table("userfavorites") \
+            .delete() \
+            .eq("user_id", user_id) \
+            .in_("variant_id", variant_ids) \
+            .execute()
+        
+        return {
+            "is_favorited": False,
+            "message": "Product removed from favorites"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while removing from favorites: {e}"
         )
