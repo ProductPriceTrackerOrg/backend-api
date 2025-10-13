@@ -16,7 +16,7 @@ router = APIRouter()
 @router.get("/autocomplete", response_model=AutocompleteSuggestions)
 async def get_autocomplete_suggestions(
     q: str = Query(..., min_length=2, description="Partial search query"),
-    limit: int = Query(10, ge=1, le=20, description="Maximum number of suggestions to return"),
+    limit: int = Query(20, ge=1, le=50, description="Maximum number of suggestions to return"),
     response: Response = None,
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:

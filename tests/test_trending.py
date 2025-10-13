@@ -7,7 +7,7 @@ import json
 from pprint import pprint
 
 # Base URL
-BASE_URL = "http://localhost:8000/api/v1"
+BASE_URL = "http://localhost:9000/api/v1"
 
 def test_trending_products():
     """Test the trending products endpoint"""

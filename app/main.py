@@ -97,6 +97,22 @@ app.include_router(favorites.router, prefix="/api/v1/favorites", tags=["Favorite
 from app.api.v1 import search
 
 app.include_router(search.router, prefix="/api/v1/search", tags=["Search"])
+# Include the retailers routes
+from app.api.v1 import retailers
+
+app.include_router(retailers.router, prefix="/api/v1/retailers", tags=["Retailers"])
+# Include the analytics routes
+from app.api.v1 import analytics
+
+app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
+# Include the price drops routes
+from app.api.v1 import price_drops
+
+app.include_router(price_drops.router, prefix="/api/v1", tags=["Price Drops"])
+
+from app.api.v1 import buyer_central
+
+app.include_router(buyer_central.router, prefix="/api/v1/buyer-central", tags=["Buyer Central"])
 
 
 @app.get("/health")
