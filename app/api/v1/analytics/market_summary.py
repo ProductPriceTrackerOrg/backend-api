@@ -1,10 +1,17 @@
 # app/api/v1/analytics/market_summary.py
 
-from fastapi import APIRouter, Query, Depends, HTTPException
+from fastapi import APIRouter, Query, Depends, HTTPException, Response
 from typing import Literal, Optional, List
+import logging
 from app.schemas.analytics.market_summary import MarketSummaryResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
+from app.services.cache_service import cache_service
+from app.services.async_query_service import async_query_service
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -27,6 +34,7 @@ def sanitize_string_for_sql(input_str: str) -> str:
 
 @router.get("/market-summary", response_model=MarketSummaryResponse, summary="Get market summary data")
 async def get_market_summary(
+    response: Response,
     category: str = "all",
     retailer: str = "all",
     time_range: Literal["7d", "30d", "90d", "1y"] = "30d",
@@ -41,6 +49,14 @@ async def get_market_summary(
     - **time_range**: The time period for analysis (7d, 30d, 90d, 1y)
     - **max_categories**: Number of distinct categories to return in distribution (max 10)
     """
+    # Cache key based on parameters
+    cache_key = f"market_summary:{category}:{retailer}:{time_range}:{max_categories}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+    
     try:
         # Build query with the appropriate filters
         if category == "all":
@@ -269,7 +285,7 @@ async def get_market_summary(
                 # In case of any error, provide empty category distribution
                 category_distribution = []
         
-        return {
+        response_data = {
             "summary": {
                 "total_products": result.total_products,
                 "total_shops": result.total_shops,
@@ -279,6 +295,11 @@ async def get_market_summary(
                 "category_distribution": category_distribution
             }
         }
+        
+        # Cache the result for 15 minutes (900 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=900)
+        
+        return response_data
         
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=f"Invalid input parameter: {str(ve)}")

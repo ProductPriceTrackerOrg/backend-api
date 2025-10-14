@@ -1,10 +1,17 @@
 # app/api/v1/analytics/shop_comparison.py
 
-from fastapi import APIRouter, Query, Depends, HTTPException
+from fastapi import APIRouter, Query, Depends, HTTPException, Response
 from typing import Literal, Optional, List
+import logging
 from app.schemas.analytics.shop_comparison import ShopComparisonResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
+from app.services.cache_service import cache_service
+from app.services.async_query_service import async_query_service
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -27,6 +34,7 @@ def sanitize_string_for_sql(input_str: str) -> str:
 
 @router.get("/shop-comparison", response_model=ShopComparisonResponse, summary="Get shop comparison data")
 async def get_shop_comparison(
+    response: Response,
     category: str = "all",
     time_range: Literal["7d", "30d", "90d", "1y"] = "30d",
     bq_client=Depends(get_bigquery_client),
@@ -39,6 +47,14 @@ async def get_shop_comparison(
     - **category**: Category ID or "all"
     - **time_range**: The time period for analysis (7d, 30d, 90d, 1y)
     """
+    # Cache key based on parameters
+    cache_key = f"shop_comparison:{category}:{time_range}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         # Build query with the appropriate filters
         if category == "all":
@@ -189,7 +205,12 @@ async def get_shop_comparison(
                 "best_categories": best_categories
             })
         
-        return {"insights": insights}
+        response_data = {"insights": insights}
+        
+        # Cache the result for 1 hour (3600 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=3600)
+        
+        return response_data
         
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=f"Invalid input parameter: {str(ve)}")

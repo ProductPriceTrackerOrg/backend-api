@@ -1,10 +1,17 @@
 # app/api/v1/analytics/price_history.py
 
-from fastapi import APIRouter, Query, Depends, HTTPException
+from fastapi import APIRouter, Query, Depends, HTTPException, Response
 from typing import Literal, Optional
+import logging
 from app.schemas.analytics.price_history import PriceHistoryResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
+from app.services.cache_service import cache_service
+from app.services.async_query_service import async_query_service
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -27,6 +34,7 @@ def sanitize_string_for_sql(input_str: str) -> str:
 
 @router.get("/price-history", response_model=PriceHistoryResponse, summary="Get price history data")
 async def get_price_history(
+    response: Response,
     time_range: Literal["7d", "30d", "90d", "1y"] = "30d",
     category: str = "all",
     retailer: str = "all",
@@ -41,6 +49,14 @@ async def get_price_history(
     - **retailer**: Shop ID or "all"
     - **view**: Data view mode (detailed or compact)
     """
+    # Cache key based on parameters
+    cache_key = f"price_history:{time_range}:{category}:{retailer}:{view}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         # Build query with the appropriate filters
         if category == "all":
@@ -150,13 +166,18 @@ async def get_price_history(
         # Generate buying recommendation based on the data
         recommendation, confidence = generate_buying_recommendation(price_history)
         
-        return {
+        response_data = {
             "price_history": price_history,
             "best_time_to_buy": {
                 "recommendation": recommendation,
                 "confidence": confidence
             }
         }
+        
+        # Cache the result for 1 hour (3600 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=3600)
+        
+        return response_data
         
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=f"Invalid input parameter: {str(ve)}")
