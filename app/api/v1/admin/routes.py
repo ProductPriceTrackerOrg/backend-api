@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from google.cloud import bigquery
 from .dependencies import get_current_admin_user
-from app.services import admin_service, user_service, audit_service
+from app.services import admin_service, user_service, audit_service, pipeline_service
 from app.api.deps import get_bigquery_client
 from pydantic import BaseModel
 from typing import Dict, Optional, List
@@ -79,6 +79,7 @@ async def resolve_anomaly_endpoint(
     Expects a JSON body, for example: { "resolution": "DATA_ERROR" }
     """
     user_email = admin_user.get("email", "unknown_admin")
+    admin_id = admin_user.get("sub") # The user's UUID from the JWT
     resolution_status = resolution_data.resolution
     
     # Validate that the resolution status is one of the allowed values
@@ -90,6 +91,15 @@ async def resolve_anomaly_endpoint(
         )
         
     result = admin_service.resolve_anomaly(bq_client, anomaly_id, resolution_status, user_email)
+    
+    # --- Step 2: Log the successful action to the audit trail ---
+    audit_service.log_admin_action(
+        admin_user_id=admin_id,
+        action_type='RESOLVE_ANOMALY',
+        target_entity_type='ANOMALY',
+        target_entity_id=str(anomaly_id),
+        details={'resolution': resolution_status}
+    )
     
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
@@ -227,3 +237,22 @@ async def update_user_status_endpoint(
     
     return {"status": "success", "message": f"User {user_id} status updated successfully."}
 
+
+
+# Pipeline monitoring end point
+@router.get("/pipeline-status")
+async def get_pipeline_status():
+    """
+    Fetches the full details of the most recent data pipeline run.
+    """
+    # Call our service to get the data for the latest run.
+    latest_run = pipeline_service.get_latest_pipeline_run()
+    
+    # If the service returns None (meaning the log table is empty),
+    # we return None, and FastAPI will handle it as an empty response.
+    if latest_run is None:
+        return None
+    
+    # Return the complete dictionary from the service. The frontend can now
+    # pick the fields it needs (status, run_timestamp, etc.) for the UI cards.
+    return latest_run

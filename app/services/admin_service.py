@@ -85,12 +85,12 @@ def get_pipeline_status_from_db():
 def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: int = 20):
     """
     Fetches a paginated list of anomalies that are pending review.
-    It joins across multiple tables to enrich the data for the frontend.
+    Ensures all floating point values are JSON-compliant.
     """
     offset = (page - 1) * per_page
     query = f"""
         SELECT
-            fa.anomaly_id,
+            CAST(fa.anomaly_id AS STRING) AS anomaly_id,  -- Convert to string in SQL
             dp.product_title_native AS productName,
             fp.current_price AS anomalousPrice,
             fp.original_price AS oldPrice,
@@ -106,23 +106,44 @@ def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: i
         LIMIT {per_page} OFFSET {offset}
     """
     try:
+        # Step 1: Fetch the data into a DataFrame
         df = bq_client.query(query).to_dataframe()
-        
-        # --- MORE ROBUST DATA SANITIZATION ---
-        # 1. Replace any special float values (Infinity, -Infinity) with pandas' standard Not a Number (NaN).
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        
-        # 2. Force the DataFrame to use standard Python objects instead of NumPy types.
-        #    This is the key step. It allows us to replace NaN with Python's `None`.
-        # 3. Use .where() to replace all NaN values with `None`, which is JSON compliant (becomes null).
-        cleaned_data = df.astype(object).where(pd.notna(df), None).to_dict('records')
-        
-        return cleaned_data
-    
-    except GoogleAPICallError as e:
-        print(f"An error occurred while fetching anomalies: {e}")
-        return {"error": str(e)}
 
+        if df.empty:
+            return []
+        
+        # Step 2: Process each column based on its data type and handle special values
+        for column in df.columns:
+            # Handle numeric columns that might contain NaN or Inf
+            if pd.api.types.is_numeric_dtype(df[column]):
+                # For any numeric column, replace NaN and Inf with None
+                df[column] = df[column].apply(
+                    lambda x: None if pd.isna(x) or np.isinf(x) else x
+                )
+        
+        # Step 3: Convert to records in a way that preserves NULL values
+        records = []
+        for _, row in df.iterrows():
+            item = {}
+            for col_name in df.columns:
+                value = row[col_name]
+                # Final check for any problematic values
+                if isinstance(value, float) and (pd.isna(value) or np.isinf(value)):
+                    item[col_name] = None
+                else:
+                    item[col_name] = value
+            records.append(item)
+        
+        logger.info(f"Successfully processed {len(records)} anomaly records")
+        return records
+
+    except Exception as e:
+        logger.error(f"An error occurred while fetching anomalies: {e}", exc_info=True)
+        return [{"error": str(e)}]
+
+
+    
+    
 # Resolve an Anomaly
 def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str, user_id: str):
     """
