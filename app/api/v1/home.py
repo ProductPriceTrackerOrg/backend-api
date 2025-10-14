@@ -795,7 +795,7 @@ async def get_featured_retailers(
             s.contact_phone,
             s.contact_whatsapp,
             COUNT(DISTINCT v.variant_id) as product_count,
-            4.0 + RAND() * 1.0 as avg_rating,
+            ROUND(4.0 + RAND() * 1.0, 2) as avg_rating,
             CASE
                 WHEN s.shop_name LIKE '%tech%' OR s.shop_name LIKE '%electron%' THEN 'Electronics'
                 WHEN s.shop_name LIKE '%fashion%' OR s.shop_name LIKE '%cloth%' THEN 'Fashion'
