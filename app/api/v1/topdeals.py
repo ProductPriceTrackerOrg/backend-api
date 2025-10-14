@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Query, Depends, HTTPException
+from fastapi import APIRouter, Query, Depends, HTTPException, Response
 from typing import List, Optional, Tuple
 from google.cloud import bigquery
+import logging
 from app.config import settings
 from app.schemas.topdeals import (
     DealResponse,
@@ -12,6 +13,7 @@ from app.schemas.topdeals import (
     RetailerDealsStats,
 )
 from app.api.deps import get_bigquery_client
+from app.services.cache_service import cache_service
 import logging
 import logging
 
@@ -352,6 +354,7 @@ def get_query_params(
 
 @router.get("/deals", response_model=DealsListResponse)
 def get_deals_endpoint(
+    response: Response,
     query: DealsQuery = Depends(get_query_params),
     bq_client: bigquery.Client = Depends(get_bigquery_client),
 ):
@@ -386,6 +389,14 @@ def get_deals_endpoint(
     - Deep discount bonus for 30%+ discounts (0-10 points)
     - Total score: 0-100 (higher is better)
     """
+    # Cache key based on all query parameters
+    cache_key = f"topdeals:deals:{query.category}:{query.retailer}:{query.brand}:{query.min_discount}:{query.max_discount}:{query.min_price}:{query.max_price}:{query.sort_by}:{query.in_stock_only}:{query.limit}:{query.page}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         deals, stats = get_deals(query, bq_client)
 
@@ -393,7 +404,7 @@ def get_deals_endpoint(
         total = len(deals)
         has_next = len(deals) == query.limit
 
-        return DealsListResponse(
+        response_data = DealsListResponse(
             items=deals,
             total=total,
             page=query.page,
@@ -401,6 +412,11 @@ def get_deals_endpoint(
             has_next=has_next,
             stats=stats,
         )
+        
+        # Cache the data for 15 minutes (900 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=900)
+        
+        return response_data
     except HTTPException:
         raise
     except Exception as e:
@@ -413,12 +429,25 @@ def get_deals_endpoint(
 
 @router.get("/deals/stats", response_model=DealsStats)
 def get_deals_stats_endpoint(
+    response: Response,
     bq_client: bigquery.Client = Depends(get_bigquery_client),
 ):
     """Get overall deals statistics"""
+    # Cache key for stats
+    cache_key = "topdeals:stats"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         dummy_query = DealsQuery()  # Use default query
         _, stats = get_deals(dummy_query, bq_client)
+        
+        # Cache the data for 1 hour (3600 seconds)
+        cache_service.set(cache_key, stats, ttl_seconds=3600)
+        
         return stats
     except HTTPException:
         raise
@@ -432,11 +461,20 @@ def get_deals_stats_endpoint(
 
 @router.get("/deals/analytics", response_model=DealsAnalyticsResponse)
 def get_deals_analytics_endpoint(
+    response: Response,
     bq_client: bigquery.Client = Depends(get_bigquery_client),
 ):
     """
     Get comprehensive deals analytics including category and retailer breakdowns
     """
+    # Cache key for analytics
+    cache_key = "topdeals:analytics"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         # Get overall stats
         dummy_query = DealsQuery()
@@ -538,13 +576,18 @@ def get_deals_analytics_endpoint(
         trending_categories = [cat.category_name for cat in category_breakdown[:5]]
         top_retailers = [ret.shop_name for ret in retailer_breakdown[:5]]
 
-        return DealsAnalyticsResponse(
+        response_data = DealsAnalyticsResponse(
             overall_stats=overall_stats,
             category_breakdown=category_breakdown,
             retailer_breakdown=retailer_breakdown,
             trending_categories=trending_categories,
             top_retailers=top_retailers,
         )
+        
+        # Cache the data for 2 hours (7200 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=7200)
+        
+        return response_data
 
     except HTTPException:
         raise
@@ -558,8 +601,16 @@ def get_deals_analytics_endpoint(
 
 # Debug endpoint
 @router.get("/deals/debug")
-def debug_deals(bq_client: bigquery.Client = Depends(get_bigquery_client)):
+def debug_deals(response: Response, bq_client: bigquery.Client = Depends(get_bigquery_client)):
     """Debug endpoint to check deals data availability"""
+    # Cache key for debug info
+    cache_key = "topdeals:debug"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         # Check products with discounts
         discount_check_sql = f"""
@@ -612,7 +663,7 @@ def debug_deals(bq_client: bigquery.Client = Depends(get_bigquery_client)):
 
         sample_deals = list(bq_client.query(sample_deals_sql).result())
 
-        return {
+        response_data = {
             "status": "success",
             "discount_stats": [dict(row) for row in discount_stats],
             "sample_deals": [dict(row) for row in sample_deals],
@@ -621,6 +672,11 @@ def debug_deals(bq_client: bigquery.Client = Depends(get_bigquery_client)):
                 "dataset_id": settings.BIGQUERY_DATASET_ID,
             },
         }
+        
+        # Cache the debug data for 1 hour (3600 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=3600)
+        
+        return response_data
 
     except Exception as e:
         logger.error(f"Debug endpoint error: {str(e)}")

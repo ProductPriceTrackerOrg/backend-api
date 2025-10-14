@@ -760,6 +760,14 @@ async def get_product_recommendations(
     If authenticated, returns personalized recommendations based on user browsing history.
     Otherwise, returns product-to-product recommendations.
     """
+    # Only cache non-personalized recommendations
+    if not current_user:
+        cache_key = f"product:{product_id}:recommendations:limit{limit}"
+        
+        # Try to get from cache first
+        cached_data = cache_service.get(cache_key)
+        if cached_data:
+            return cached_data
     try:
         # Different logic based on whether user is authenticated
         if current_user:
@@ -931,7 +939,13 @@ async def get_product_recommendations(
                         "recommendation_type": "category_match"
                     })
         
-        return {"recommendations": recommendations}
+        result = {"recommendations": recommendations}
+        
+        # Cache non-personalized recommendations
+        if not current_user:
+            cache_service.set(cache_key, result, 3600)  # Cache for 1 hour
+        
+        return result
         
     except Exception as e:
         raise HTTPException(
@@ -952,6 +966,16 @@ async def compare_products(
     
     Shows specifications and prices for multiple products to aid comparison.
     """
+    # Cache key based on parameters
+    cache_key = f"product:compare:{product_ids}"
+    if retailer_id:
+        cache_key += f":{retailer_id}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         # Parse the product IDs
         try:
@@ -1059,10 +1083,14 @@ async def compare_products(
         # Determine common attributes to use as comparison points
         common_attributes = ["processor", "memory", "storage", "screen", "battery", "color", "weight", "dimensions", "warranty"]
         
-        return {
+        result = {
             "comparison": compared_products,
             "common_attributes": common_attributes
         }
+        
+        # Store in cache with TTL of 3 hours
+        cache_service.set(cache_key, result, 10800)
+        return result
         
     except HTTPException:
         raise

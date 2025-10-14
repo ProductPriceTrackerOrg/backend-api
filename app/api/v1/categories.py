@@ -174,6 +174,19 @@ async def get_category_products(
     Get paginated list of products for a specific category (including its subcategories)
     with secure filtering and sorting options, all in a single efficient query.
     """
+    # Create a cache key with all parameters
+    cache_key = f"category:{category_id}:products:page{page}:limit{limit}:sort{sort_by}"
+    if brand:
+        cache_key += f":brand{brand}"
+    if min_price:
+        cache_key += f":min{min_price}"
+    if max_price:
+        cache_key += f":max{max_price}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
     cache_key = f"category:{category_id}:products:page{page}:limit{limit}:sort{sort_by}:min{min_price}:max{max_price}:brand{brand}"
     
     cached_data = cache_service.get(cache_key)
