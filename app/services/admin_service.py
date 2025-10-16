@@ -85,64 +85,67 @@ def get_pipeline_status_from_db():
 def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: int = 20):
     """
     Fetches a paginated list of anomalies that are pending review.
-    Ensures all floating point values are JSON-compliant.
+    This version now correctly calculates the 'oldPrice' by looking at the
+    price from the day before the anomaly.
     """
     offset = (page - 1) * per_page
+    # This query is now more advanced. It uses a CTE and a LAG window function
+    # to find the price of each product on the day before the anomaly.
     query = f"""
+        WITH PriceHistory AS (
+            -- Step 1: Create a history of prices for each variant, including the previous day's price.
+            SELECT
+                price_fact_id,
+                variant_id,
+                date_id,
+                current_price,
+                -- The LAG function looks back one row in the partition (ordered by date)
+                -- to get the price from the previous day for that specific variant.
+                LAG(current_price, 1) OVER (PARTITION BY variant_id ORDER BY date_id) as previous_day_price
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice`
+        )
+        -- Step 2: Join the anomaly data with our enriched price history.
         SELECT
-            CAST(fa.anomaly_id AS STRING) AS anomaly_id,  -- Convert to string in SQL
+            fa.anomaly_id,
             dp.product_title_native AS productName,
-            fp.current_price AS anomalousPrice,
-            fp.original_price AS oldPrice,
+            ph.current_price AS anomalousPrice,
+            -- This is the key change: 'oldPrice' is now the actual previous day's price.
+            ph.previous_day_price AS oldPrice,
             dp.product_url AS productUrl,
-            ds.website_url AS vendorUrl
+            ds.website_url AS vendorUrl,
+            fa.anomaly_type
         FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` AS fa
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fp ON fa.price_fact_id = fp.price_fact_id
-        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS dv ON fp.variant_id = dv.variant_id
+        -- Join to our enriched price history instead of the raw price table
+        LEFT JOIN PriceHistory AS ph ON fa.price_fact_id = ph.price_fact_id
+        LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` AS dv ON ph.variant_id = dv.variant_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` AS dp ON dv.shop_product_id = dp.shop_product_id
         LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` AS ds ON dp.shop_id = ds.shop_id
         WHERE fa.status = 'PENDING_REVIEW'
-        ORDER BY fa.created_at DESC
+        ORDER BY fa.anomaly_id DESC
         LIMIT {per_page} OFFSET {offset}
     """
     try:
-        # Step 1: Fetch the data into a DataFrame
         df = bq_client.query(query).to_dataframe()
 
         if df.empty:
             return []
         
-        # Step 2: Process each column based on its data type and handle special values
-        for column in df.columns:
-            # Handle numeric columns that might contain NaN or Inf
-            if pd.api.types.is_numeric_dtype(df[column]):
-                # For any numeric column, replace NaN and Inf with None
-                df[column] = df[column].apply(
-                    lambda x: None if pd.isna(x) or np.isinf(x) else x
-                )
-        
-        # Step 3: Convert to records in a way that preserves NULL values
-        records = []
-        for _, row in df.iterrows():
-            item = {}
-            for col_name in df.columns:
-                value = row[col_name]
-                # Final check for any problematic values
-                if isinstance(value, float) and (pd.isna(value) or np.isinf(value)):
-                    item[col_name] = None
-                else:
-                    item[col_name] = value
-            records.append(item)
-        
-        logger.info(f"Successfully processed {len(records)} anomaly records")
-        return records
+        # --- Data Sanitization and Transformation ---
+        if 'anomaly_id' in df.columns:
+            df['anomaly_id'] = df['anomaly_id'].astype(str)
 
-    except Exception as e:
-        logger.error(f"An error occurred while fetching anomalies: {e}", exc_info=True)
+        float_columns = ['anomalousPrice', 'oldPrice']
+        for col in float_columns:
+            if col in df.columns:
+                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+
+        return df.to_dict('records')
+
+    except (GoogleAPICallError, Exception) as e:
+        print(f"An error occurred while fetching anomalies: {e}")
         return [{"error": str(e)}]
-
-
     
+      
     
 # Resolve an Anomaly
 def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str, user_id: str):
@@ -312,3 +315,60 @@ def get_recent_admin_activity() -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"An error occurred while fetching admin activity from Supabase: {e}")
         return [{"error": str(e)}]
+
+
+# Function for getting the price history of an anomalous product
+def get_price_history_for_anomaly(bq_client: bigquery.Client, anomaly_id: int, days: int = 30) -> List[Dict[str, Any]]:
+    """
+    Fetches the price history for the variant associated with a specific anomaly.
+    It performs a lookup to find the variant_id from the anomaly_id.
+    """
+    try:
+        if bq_client is None: raise Exception("BigQuery client not provided.")
+
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days - 1)
+
+        # This single, efficient query performs the exact lookup you described:
+        # Anomaly ID -> Price Fact ID -> Variant ID -> Price History
+        query = f"""
+            -- Step 2: Fetch the price history for the variant_id we found.
+            SELECT
+                d.full_date AS date,
+                fp.current_price AS price
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS d ON fp.date_id = d.date_id
+            WHERE
+                -- This subquery is the key. It finds the correct variant_id.
+                fp.variant_id = (
+                    SELECT price_table.variant_id
+                    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` AS anomaly_table
+                    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS price_table
+                        ON anomaly_table.price_fact_id = price_table.price_fact_id
+                    WHERE anomaly_table.anomaly_id = @anomaly_id
+                    LIMIT 1
+                )
+            AND d.full_date BETWEEN @start_date AND @end_date
+            ORDER BY d.full_date ASC
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("anomaly_id", "INT64", anomaly_id),
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+            ]
+        )
+
+        df = bq_client.query(query, job_config=job_config).to_dataframe()
+
+        if df.empty:
+            return []
+
+        # Sanitize and convert to records
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        return df.where(pd.notna(df), None).to_dict('records')
+
+    except (GoogleAPICallError, Exception) as e:
+        print(f"An error occurred while fetching price history for anomaly {anomaly_id}: {e}")
+        return [{"error": str(e)}]
+

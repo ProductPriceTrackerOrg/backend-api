@@ -133,48 +133,59 @@ def get_user_signups_over_time(start_date: date, end_date: date) -> List[Dict[st
 # Function Get User List for User Management 
 def get_users(search: Optional[str], is_active: Optional[bool], page: int, per_page: int) -> Dict[str, Any]:
     """
-    Fetches a paginated list of users from the profiles table, 
-    with optional search and status filters.
+    Fetches a paginated list of users with their roles using separate queries.
     """
     try:
         supabase = get_supabase_client()
         
-        # Start building the query. We select all columns needed by the UI.
-        query = supabase.table('profiles').select(
-            'user_id, email, full_name, is_active',
-            count='exact' # This tells Supabase to return the total count for pagination
+        # 1. First query: Get users from profiles
+        profiles_query = supabase.table('profiles').select(
+            'user_id, email, full_name, is_active, created_at',
+            count='exact'
         )
         
-        # Apply search filter if a search term is provided.
-        # It searches case-insensitively across 'full_name' and 'email'.
         if search:
-            query = query.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%")
+            profiles_query = profiles_query.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%")
             
-        # Apply status filter if 'active' or 'inactive' is specified.
         if is_active is not None:
-            query = query.eq('is_active', is_active)
+            profiles_query = profiles_query.eq('is_active', is_active)
             
-        # Apply pagination to fetch only the data for the current page.
         offset = (page - 1) * per_page
-        query = query.range(offset, offset + per_page - 1).order('created_at', desc=True)
+        profiles_query = profiles_query.range(offset, offset + per_page - 1).order('created_at', desc=True)
         
-        # Execute the final query.
-        response = query.execute()
+        profiles_response = profiles_query.execute()
         
-        # Some users might have a null 'full_name'. The API model expects a string.
-        # We'll replace any None values with an empty string to prevent validation errors.
-        cleaned_users = []
-        for user in response.data:
+        # 2. Get all user IDs from the profiles result
+        user_ids = [user['user_id'] for user in profiles_response.data]
+        
+        # 3. Second query: Get role mappings for these users
+        role_mappings = {}
+        if user_ids:
+            roles_response = supabase.table('userrolemapping').select(
+                'user_id, role_id'
+            ).in_('user_id', user_ids).execute()
+            
+            # Create a mapping of user_id to role_id
+            for mapping in roles_response.data:
+                role_mappings[mapping['user_id']] = mapping['role_id']
+        
+        # 4. Process users and add role information
+        processed_users = []
+        for user in profiles_response.data:
+            # Clean up null full_name
             if user.get('full_name') is None:
                 user['full_name'] = ""
-            cleaned_users.append(user)
+            
+            # Add role information
+            role_id = role_mappings.get(user['user_id'])
+            user['role'] = 'Admin' if role_id == 1 else 'User'
+            
+            processed_users.append(user)
 
-        # Return the cleaned data in the format expected by the frontend.
         return {
-            "users": cleaned_users,
-            "total": response.count
+            "users": processed_users,
+            "total": profiles_response.count
         }
-        
 
     except Exception as e:
         logger.error(f"Error fetching users list from Supabase: {e}")

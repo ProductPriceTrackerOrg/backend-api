@@ -22,6 +22,8 @@ class User(BaseModel):
     email: str
     full_name: str
     is_active: bool
+    role: str
+    created_at: str
 
 class UserListResponse(BaseModel):
     users: List[User]
@@ -44,8 +46,7 @@ async def get_dashboard_stats(bq_client: bigquery.Client = Depends(get_bigquery_
     live_stats = admin_service.get_dashboard_stats_from_db(bq_client)
     return live_stats
 
-
-# Anomaly fetching end point
+# End point for fetching anomalies
 @router.get("/anomalies")
 async def get_anomalies(
     page: int = 1, 
@@ -56,8 +57,11 @@ async def get_anomalies(
     Fetches a paginated list of price anomalies that are pending review.
     """
     anomalies = admin_service.get_pending_anomalies(bq_client, page, per_page)
-    if "error" in anomalies:
-        raise HTTPException(status_code=500, detail=anomalies["error"])
+    
+    # This is a robust way to check for an error from the service.
+    if isinstance(anomalies, list) and anomalies and "error" in anomalies[0]:
+        raise HTTPException(status_code=500, detail=anomalies[0]["error"])
+        
     return anomalies
 
 
@@ -183,10 +187,10 @@ async def get_users_list(
     search: Optional[str] = None,
     status: Optional[str] = Query(None, pattern="^(active|inactive)$"),
     page: int = 1,
-    per_page: int = 10
+    per_page: int = 20
 ):
     """
-    Fetches a paginated and searchable list of all users.
+    Fetches a paginated and searchable list of all users, including their roles.
     """
     is_active_filter = None
     if status == "active":
@@ -271,3 +275,20 @@ async def get_recent_activity():
         raise HTTPException(status_code=500, detail=activity_data[0]["error"])
         
     return activity_data
+
+# End point for Anomaly Price History
+@router.get("/anomalies/{anomaly_id}/price-history")
+async def get_anomaly_price_history_endpoint(
+    anomaly_id: int,
+    days: int = 90,
+    bq_client: bigquery.Client = Depends(get_bigquery_client)
+):
+    """
+    Fetches the recent price history for the variant associated with a specific anomaly.
+    """
+    history = admin_service.get_price_history_for_anomaly(bq_client, anomaly_id, days)
+    
+    if isinstance(history, list) and history and "error" in history[0]:
+        raise HTTPException(status_code=500, detail=history[0]["error"])
+        
+    return history
