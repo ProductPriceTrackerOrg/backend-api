@@ -276,3 +276,39 @@ def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_d
         print(f"An error occurred while fetching top tracked products: {e}")
         return [{"error": str(e)}]
 
+# Function for getting the recent admin activities
+def get_recent_admin_activity() -> List[Dict[str, Any]]:
+    """
+    Fetches the 5 most recent admin activities from the audit log table in Supabase.
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Query the new log table, order by the creation time, and get the latest 10.
+        response = supabase.table('adminactivitylog').select(
+            'admin_user_id, action_type, target_entity_id, details_json, activity_timestamp'
+        ).order('activity_timestamp', desc=True).limit(10).execute()
+
+        activities = []
+        for item in response.data:
+            action_string = ""
+            # Construct the human-readable "Action" string based on the structured data
+            if item['action_type'] == 'RESOLVE_ANOMALY':
+                resolution = item.get('details_json', {}).get('resolution', 'resolved')
+                action_string = f"Marked anomaly #{item['target_entity_id']} as '{resolution}'."
+            elif item['action_type'] == 'UPDATE_USER_STATUS':
+                new_status = item.get('details_json', {}).get('new_status', 'updated')
+                action_string = f"Changed status of user #{item['target_entity_id']} to {new_status}."
+            else:
+                action_string = item.get('action_type', 'Performed an unknown action.').replace('_', ' ').title()
+
+            activities.append({
+                "admin": item['admin_user_id'], # In a real app, you'd join to get the email
+                "action": action_string,
+                "timestamp": item['activity_timestamp']
+            })
+        
+        return activities
+    except Exception as e:
+        print(f"An error occurred while fetching admin activity from Supabase: {e}")
+        return [{"error": str(e)}]

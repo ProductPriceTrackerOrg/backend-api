@@ -256,3 +256,18 @@ async def get_pipeline_status():
     # Return the complete dictionary from the service. The frontend can now
     # pick the fields it needs (status, run_timestamp, etc.) for the UI cards.
     return latest_run
+
+
+# End point for fetching the recent admin actions
+@router.get("/recent-activity")
+async def get_recent_activity():
+    """
+    Fetches a list of the most recent actions performed by admins from the audit log.
+    """
+    activity_data = admin_service.get_recent_admin_activity()
+    
+    # Check if the service returned an error
+    if isinstance(activity_data, list) and activity_data and "error" in activity_data[0]:
+        raise HTTPException(status_code=500, detail=activity_data[0]["error"])
+        
+    return activity_data
