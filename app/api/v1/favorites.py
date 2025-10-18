@@ -50,8 +50,8 @@ async def get_user_favorites(
         
         # Try to get from cache first
         cached_data = cache_service.get(cache_key)
-        if cached_data:
-            return cached_data
+        # if cached_data:
+        #     return cached_data
         
         # Get the user's favorites from Supabase
         # Note: The column is named "variant_id" but actually stores the product ID (shop_product_id)
