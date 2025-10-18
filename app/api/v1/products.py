@@ -19,6 +19,46 @@ from app.schemas.product import (
 
 router = APIRouter()
 
+# Helper to reuse the variant selection logic across endpoints
+def _get_highest_price_variant_id(
+    bq_client: bigquery.Client,
+    product_id: int,
+    retailer_id: Optional[int]
+) -> Optional[int]:
+    """Return the variant_id with the highest latest price for the given product."""
+    variant_query = f"""
+    WITH MaxPriceVariant AS (
+        SELECT
+            v.variant_id,
+            fpp.current_price
+        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON v.variant_id = fpp.variant_id
+        WHERE sp.shop_product_id = @product_id
+          AND (@retailer_id IS NULL OR s.shop_id = @retailer_id)
+        QUALIFY ROW_NUMBER() OVER(PARTITION BY v.variant_id ORDER BY fpp.date_id DESC) = 1
+        ORDER BY fpp.current_price DESC
+        LIMIT 1
+    )
+    SELECT variant_id FROM MaxPriceVariant
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("product_id", "INT64", product_id),
+            bigquery.ScalarQueryParameter("retailer_id", "INT64", retailer_id),
+        ]
+    )
+
+    query_job = bq_client.query(variant_query, job_config=job_config)
+    rows = list(query_job.result())
+    if not rows:
+        return None
+
+    variant_value = rows[0]["variant_id"]
+    return int(variant_value) if variant_value is not None else None
+
 # Supabase client initialization function
 def get_supabase_client():
     """Returns a Supabase client using the URL and key from settings."""
@@ -412,30 +452,42 @@ async def get_price_forecast(
         return cached_data
     
     try:
+        variant_id = _get_highest_price_variant_id(bq_client, product_id, retailer_id)
+        if variant_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No price data available for product ID {product_id}"
+            )
+
         query = f"""
-        -- Get price forecasts
         SELECT
-            CAST(fpf.forecast_date AS STRING) as date,
+            fpf.variant_id,
+            fpf.forecast_date,
+            CAST(fpf.forecast_date AS STRING) AS date,
             fpf.predicted_price,
-            fpf.confidence_upper as upper_bound,
-            fpf.confidence_lower as lower_bound,
+            fpf.confidence_upper AS upper_bound,
+            fpf.confidence_lower AS lower_bound,
             dm.model_name,
             dm.model_version,
-            CAST(dm.training_date AS STRING) as last_trained
+            CAST(dm.training_date AS STRING) AS last_trained,
+            fpf.created_at
         FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceForecast` fpf
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON fpf.variant_id = v.variant_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON v.shop_product_id = sp.shop_product_id
-        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id
         JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimModel` dm ON fpf.model_id = dm.model_id
-        WHERE sp.shop_product_id = {product_id}
-        {f"AND s.shop_id = {retailer_id}" if retailer_id else ""}
-        AND fpf.forecast_date > CURRENT_DATE()
-        AND fpf.forecast_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {days} DAY)
+        WHERE fpf.variant_id = @variant_id
+          AND fpf.forecast_date > CURRENT_DATE()
+          AND fpf.forecast_date <= DATE_ADD(CURRENT_DATE(), INTERVAL {days} DAY)
+        QUALIFY ROW_NUMBER() OVER(PARTITION BY fpf.forecast_date ORDER BY fpf.created_at DESC) = 1
         ORDER BY fpf.forecast_date ASC
         """
-        
-        query_job = bq_client.query(query)
-        results = list(query_job.result())
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("variant_id", "INT64", variant_id),
+            ]
+        )
+
+        query_job = bq_client.query(query, job_config=job_config)
+        results = [dict(row) for row in query_job.result()]
         
         if not results:
             raise HTTPException(
@@ -447,20 +499,36 @@ async def get_price_forecast(
         model_info = {
             "model_name": results[0]["model_name"],
             "model_version": results[0]["model_version"],
-            "last_trained": results[0]["last_trained"]
+            "last_trained": results[0]["last_trained"],
+            "variant_id": variant_id
         }
         
         # Format forecast points
         forecast_points = []
         for row in results:
+            predicted_price = row["predicted_price"]
+            upper_bound = row["upper_bound"]
+            lower_bound = row["lower_bound"]
+
+            confidence = None
+            if (
+                predicted_price is not None
+                and predicted_price != 0
+                and upper_bound is not None
+                and lower_bound is not None
+            ):
+                span = upper_bound - lower_bound
+                confidence = max(0.0, min(100.0, round(100 - ((span / predicted_price) * 100), 2)))
+
             forecast_points.append({
                 "date": row["date"],
-                "predicted_price": row["predicted_price"],
-                "upper_bound": row["upper_bound"],
-                "lower_bound": row["lower_bound"],
-                # Calculate confidence as the range between upper and lower bounds
-                "confidence": round(100 - ((row["upper_bound"] - row["lower_bound"]) / row["predicted_price"] * 100), 0) if row["predicted_price"] > 0 else 0
+                "predicted_price": predicted_price,
+                "upper_bound": upper_bound,
+                "lower_bound": lower_bound,
+                "confidence": confidence
             })
+        
+        print(f"Using price forecast for product {product_id}, highest price variant {variant_id}")
         
         result = {
             "forecasts": forecast_points,
@@ -484,6 +552,7 @@ async def get_price_anomalies(
     product_id: int = Path(..., description="The ID of the product"),
     days: int = Query(30, ge=1, le=90, description="Number of days to check for anomalies"),
     min_score: float = Query(0.7, ge=0, le=1, description="Minimum anomaly score threshold"),
+    retailer_id: Optional[int] = Query(None, description="Filter anomalies for a specific retailer"),
     response: Response = None,
     bq_client: bigquery.Client = Depends(get_bigquery_client)
 ) -> Dict:
@@ -493,6 +562,8 @@ async def get_price_anomalies(
     Identifies unusual price changes that might indicate special offers or pricing errors.
     """
     cache_key = f"product:{product_id}:anomalies:days{days}:score{min_score}"
+    if retailer_id:
+        cache_key += f":retailer:{retailer_id}"
     
     # Try to get from cache first
     cached_data = cache_service.get(cache_key)
@@ -500,47 +571,72 @@ async def get_price_anomalies(
         return cached_data
     
     try:
+        variant_id = _get_highest_price_variant_id(bq_client, product_id, retailer_id)
+        if variant_id is None:
+            # No price data, return empty anomalies to avoid repeated lookups
+            result = {"anomalies": []}
+            cache_service.set(cache_key, result, 3600)
+            return result
+
         query = f"""
-        -- Get price anomalies
-        WITH AnomaliesWithPrices AS (
+        WITH VariantPrices AS (
             SELECT
-                fpa.anomaly_id,
-                CAST(dd.full_date AS STRING) as date,
-                fpp.current_price as price,
-                LAG(fpp.current_price) OVER(PARTITION BY v.variant_id ORDER BY dd.full_date) as previous_price,
-                fpa.anomaly_score,
-                fpa.anomaly_type,
-                dm.model_name
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` fpa
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp ON fpa.price_fact_id = fpp.price_fact_id
+                fpp.price_fact_id,
+                fpp.current_price AS price,
+                dd.full_date,
+                ROW_NUMBER() OVER(PARTITION BY dd.full_date ORDER BY fpp.price_fact_id DESC) AS daily_rank
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
             JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON fpp.date_id = dd.date_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON fpp.variant_id = v.variant_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON v.shop_product_id = sp.shop_product_id
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimModel` dm ON fpa.model_id = dm.model_id
-            WHERE sp.shop_product_id = {product_id}
-            AND dd.full_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-            AND fpa.anomaly_score >= {min_score}
+            WHERE fpp.variant_id = @variant_id
+              AND dd.full_date >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+        ),
+        LatestVariantPrices AS (
+            SELECT
+                price_fact_id,
+                price,
+                full_date
+            FROM VariantPrices
+            WHERE daily_rank = 1
+        ),
+        PricesWithChange AS (
+            SELECT
+                price_fact_id,
+                price,
+                full_date,
+                LAG(price) OVER(ORDER BY full_date) AS previous_price
+            FROM LatestVariantPrices
         )
-        
         SELECT
-            anomaly_id,
-            date,
-            price,
-            previous_price,
-            anomaly_score,
-            anomaly_type,
-            model_name,
-            CASE WHEN previous_price > 0 
-                THEN ROUND(((price - previous_price) / previous_price) * 100, 2)
+            fpa.anomaly_id,
+            CAST(pwc.full_date AS STRING) AS date,
+            pwc.price,
+            pwc.previous_price,
+            fpa.anomaly_score,
+            fpa.anomaly_type,
+            dm.model_name,
+            dm.model_version,
+            CAST(dm.training_date AS STRING) AS last_trained,
+            CASE
+                WHEN pwc.previous_price IS NOT NULL AND pwc.previous_price != 0
+                THEN ROUND(((pwc.price - pwc.previous_price) / pwc.previous_price) * 100, 2)
                 ELSE 0
-            END as change_percentage
-        FROM AnomaliesWithPrices
-        WHERE previous_price IS NOT NULL
-        ORDER BY anomaly_score DESC, date DESC
+            END AS change_percentage
+        FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` fpa
+        JOIN PricesWithChange pwc ON fpa.price_fact_id = pwc.price_fact_id
+        JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimModel` dm ON fpa.model_id = dm.model_id
+        WHERE fpa.anomaly_score >= @min_score
+        ORDER BY fpa.anomaly_score DESC, pwc.full_date DESC
         """
-        
-        query_job = bq_client.query(query)
-        results = list(query_job.result())
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("variant_id", "INT64", variant_id),
+                bigquery.ScalarQueryParameter("min_score", "FLOAT64", float(min_score)),
+            ]
+        )
+
+        query_job = bq_client.query(query, job_config=job_config)
+        results = [dict(row) for row in query_job.result()]
         
         # Format the anomalies
         anomalies = []
@@ -555,6 +651,8 @@ async def get_price_anomalies(
                 "anomaly_type": row["anomaly_type"],
                 "model_name": row["model_name"]
             })
+
+        print(f"Using price anomalies for product {product_id}, highest price variant {variant_id}")
         
         result = {"anomalies": anomalies}
         
