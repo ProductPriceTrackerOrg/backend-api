@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 # Cache keys
 USER_COUNT_CACHE_KEY = "user_count_total"
 USER_COUNT_CACHE_TTL = 3600  # 1 hour
+USERS_LIST_CACHE_KEY_PREFIX = "admin:users:"
+USERS_LIST_CACHE_TTL = 300 # 5 minutes
 
 def get_total_users_count() -> int:
     """
@@ -133,8 +135,19 @@ def get_user_signups_over_time(start_date: date, end_date: date) -> List[Dict[st
 # Function Get User List for User Management 
 def get_users(search: Optional[str], is_active: Optional[bool], page: int, per_page: int) -> Dict[str, Any]:
     """
-    Fetches a paginated list of users with their roles using separate queries.
+    Fetches a paginated list of users with their roles, with caching.
     """
+    # --- NEW: Caching Logic Start ---
+    status_str = str(is_active) if is_active is not None else "all"
+    cache_key = f"{USERS_LIST_CACHE_KEY_PREFIX}{search or ''}:{status_str}:{page}:{per_page}"
+    
+    cached_users = cache_service.get(cache_key)
+    if cached_users is not None:
+        logger.info(f"Returning cached user list for key: {cache_key}")
+        return cached_users
+    
+    logger.info(f"Cache miss for user list. Querying database for key: {cache_key}")
+    # --- NEW: Caching Logic End ---
     try:
         supabase = get_supabase_client()
         
@@ -182,11 +195,16 @@ def get_users(search: Optional[str], is_active: Optional[bool], page: int, per_p
             
             processed_users.append(user)
 
-        return {
+        result =  {
             "users": processed_users,
             "total": profiles_response.count
         }
-
+        
+        # --- NEW: Set result in cache before returning ---
+        cache_service.set(cache_key, result, USERS_LIST_CACHE_TTL)
+        
+        return result
+        
     except Exception as e:
         logger.error(f"Error fetching users list from Supabase: {e}")
         return {"error": str(e)}
@@ -208,7 +226,11 @@ def update_user_status(user_id: str, is_active: bool) -> Dict[str, Any]:
         # If the query didn't find a user with that ID, the data list will be empty.
         if not response.data:
             return {"error": f"User with ID {user_id} not found."}
-            
+        
+        # --- NEW: Invalidate user list cache after update ---
+        cache_service.delete_pattern(f"{USERS_LIST_CACHE_KEY_PREFIX}*")
+        logger.info("Invalidated user list cache due to status update.")
+          
         # Return the email of the updated user so the route can create a more descriptive log.
         return {"email": response.data[0]['email']}
 
