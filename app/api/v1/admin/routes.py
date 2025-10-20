@@ -1,11 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from google.cloud import bigquery
 from .dependencies import get_current_admin_user
 from app.services import admin_service, user_service, audit_service, pipeline_service
 from app.api.deps import get_bigquery_client
+from app.db import supabase_client
 from pydantic import BaseModel
 from typing import Dict, Optional, List
 from datetime import date, timedelta
+import logging
+
+logger = logging.getLogger(__name__)
 
 # All routes in this file will have the prefix /admin
 # and will be protected by our admin security dependency.
@@ -292,3 +296,63 @@ async def get_anomaly_price_history_endpoint(
         raise HTTPException(status_code=500, detail=history[0]["error"])
         
     return history
+
+
+# --- NEW ENDPOINT TO PROMOTE A USER TO ADMIN ---
+@router.post("/users/{user_id}/make-admin", status_code=status.HTTP_200_OK)
+async def make_user_admin_endpoint(
+    user_id: str,
+    admin_user: Dict = Depends(get_current_admin_user)
+):
+    """
+    Promotes a specified user to the 'Admin' role.
+    This is a protected endpoint that logs the action to the audit trail.
+    """
+    logger.info(f"Received request to promote user {user_id} to admin")
+    
+    # Store the result outside try block to return it later
+    promotion_result = None
+    
+    try:
+        # Call the service function to handle the business logic
+        result = admin_service.promote_user_to_admin(user_id=user_id)
+        promotion_result = result
+        
+        # Handle any errors returned from the service
+        if "error" in result:
+            # Determine the appropriate status code based on the error
+            if "Configuration error" in result["error"]:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=result["error"])
+            elif "Database connection error" in result["error"]:
+                # Special handling for connection errors
+                logger.error(f"Database connection error: {result['error']}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+                    detail="Database service unavailable. Please try again later."
+                )
+            else:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result["error"])
+    except HTTPException:
+        # Re-raise HTTP exceptions without wrapping
+        raise
+    except Exception as e:
+        logger.error(f"Endpoint error making user {user_id} admin: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Server error: {str(e)}")
+
+    # If successful, log this critical action to our audit trail
+    # Only attempt to log the action if the promotion was successful
+    if promotion_result and "status" in promotion_result and promotion_result["status"] == "success":
+        try:
+            admin_id = admin_user.get("sub") # The admin's UUID from their JWT
+            audit_service.log_admin_action(
+                admin_user_id=admin_id,
+                action_type='PROMOTE_USER_TO_ADMIN',
+                target_entity_type='USER',
+                target_entity_id=user_id,
+                details={'new_role': 'Admin'}
+            )
+        except Exception as audit_error:
+            logger.error(f"Failed to log admin action, but user promotion was successful: {audit_error}")
+            # We don't want to fail the entire operation just because logging failed
+    
+    return promotion_result

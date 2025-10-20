@@ -1,5 +1,5 @@
-# This service will contain all the business logic for the admin dashboard,
-# such as querying BigQuery for anomalies or PostgreSQL for user data.
+# This service contains all the business logic for the admin dashboard,
+# with caching implementation for performance optimization.
 import logging
 import pandas as pd
 import numpy as np
@@ -7,17 +7,42 @@ from google.cloud import bigquery
 from app.config import settings
 from google.api_core.exceptions import GoogleAPICallError
 from app.services.user_service import get_total_users_count
-from app.db.supabase_client  import get_supabase_client
-from typing import Dict, Any, List
+from app.db.supabase_client import get_supabase_client
+from app.services.cache_service import cache_service
+from typing import Dict, Any, List, Optional
 from datetime import date, timedelta
 
 logger = logging.getLogger(__name__)
 
+# Cache keys and TTLs for admin services
+DASHBOARD_STATS_CACHE_KEY = "admin:dashboard:stats"
+DASHBOARD_STATS_CACHE_TTL = 600  # 10 minutes
+
+PENDING_ANOMALIES_CACHE_KEY_PREFIX = "admin:anomalies:page:"
+ANOMALIES_CACHE_TTL = 600  # Increased to 10 minutes for better performance
+
+CATEGORY_DISTRIBUTION_CACHE_KEY_PREFIX = "admin:category_distribution:"
+CATEGORY_DISTRIBUTION_CACHE_TTL = 3600  # 1 hour
+
+TOP_TRACKED_PRODUCTS_CACHE_KEY_PREFIX = "admin:top_tracked_products:"
+TOP_TRACKED_PRODUCTS_CACHE_TTL = 1800  # 30 minutes
+
+RECENT_ADMIN_ACTIVITY_CACHE_KEY = "admin:recent_activity"
+RECENT_ADMIN_ACTIVITY_CACHE_TTL = 300  # 5 minutes
+
+PRICE_HISTORY_CACHE_KEY_PREFIX = "admin:anomaly:price_history:"
+PRICE_HISTORY_CACHE_TTL = 3600  # 1 hour
+
 def get_dashboard_stats_from_db(bq_client: bigquery.Client):
     """
     Fetches live statistics for the admin dashboard directly from BigQuery,
-    matching the frontend UI cards.
+    matching the frontend UI cards. Uses cache for better performance.
     """
+    # Try to get from cache first
+    cached_stats = cache_service.get(DASHBOARD_STATS_CACHE_KEY)
+    if cached_stats is not None:
+        return cached_stats
+        
     try:
         # Query 1: Get total products from DimShopProduct
         products_query = f"""
@@ -27,8 +52,6 @@ def get_dashboard_stats_from_db(bq_client: bigquery.Client):
         products_result = bq_client.query(products_query).to_dataframe()
         total_products = int(products_result['total_products'][0]) if not products_result.empty else 0
         
-        
-
         # Query 2: Get total retailers from DimShop
         retailers_query = f"""
             SELECT COUNT(DISTINCT shop_id) as total_retailers
@@ -47,12 +70,11 @@ def get_dashboard_stats_from_db(bq_client: bigquery.Client):
             categories_result = bq_client.query(categories_query).to_dataframe()
             total_categories = int(categories_result['total_categories'][0]) if not categories_result.empty else 0
         except Exception as e:
-            print(f"Warning: Could not fetch categories count. Table might not exist yet: {e}")
+            logger.warning(f"Could not fetch categories count. Table might not exist yet: {e}")
             total_categories = 0
 
         # Get total users from Supabase via the user service
         total_users = get_total_users_count()
-        
         
         # Return stats with explicit type conversion to ensure all values are standard Python types
         stats = {
@@ -61,11 +83,15 @@ def get_dashboard_stats_from_db(bq_client: bigquery.Client):
             "totalUsers": int(total_users),
             "totalCategories": int(total_categories)
         }
+        
+        # Cache the result
+        cache_service.set(DASHBOARD_STATS_CACHE_KEY, stats, DASHBOARD_STATS_CACHE_TTL)
+        
         return stats
 
     except GoogleAPICallError as e:
         # Handle potential API errors (e.g., permissions, table not found)
-        print(f"An error occurred while querying BigQuery for dashboard stats: {e}")
+        logger.error(f"An error occurred while querying BigQuery for dashboard stats: {e}")
         # Return a default/error state that matches the expected keys
         return {
             "totalProducts": 0,
@@ -74,6 +100,11 @@ def get_dashboard_stats_from_db(bq_client: bigquery.Client):
             "totalCategories": 0,
             "error": str(e)
         }
+
+def invalidate_dashboard_stats_cache():
+    """Invalidate dashboard stats cache when data changes"""
+    return cache_service.delete(DASHBOARD_STATS_CACHE_KEY)
+
 
 def get_pipeline_status_from_db():
     """
@@ -85,11 +116,20 @@ def get_pipeline_status_from_db():
 def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: int = 20):
     """
     Fetches a paginated list of anomalies that are pending review.
-    This version now correctly calculates the 'oldPrice' by looking at the
-    price from the day before the anomaly.
+    Uses caching for better performance.
     """
+    cache_key = f"{PENDING_ANOMALIES_CACHE_KEY_PREFIX}{page}:{per_page}"
+    
+    # Try to get from cache first
+    cached_anomalies = cache_service.get(cache_key)
+    if cached_anomalies is not None:
+        logger.info(f"Using cached anomalies for page {page}")
+        return cached_anomalies
+        
+    logger.info(f"Cache miss for anomalies page {page}, querying database")
+    
     offset = (page - 1) * per_page
-    # This query is now more advanced. It uses a CTE and a LAG window function
+    # This query uses a CTE and a LAG window function
     # to find the price of each product on the day before the anomaly.
     query = f"""
         WITH PriceHistory AS (
@@ -128,7 +168,10 @@ def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: i
         df = bq_client.query(query).to_dataframe()
 
         if df.empty:
-            return []
+            result = []
+            # Cache empty result
+            cache_service.set(cache_key, result, ANOMALIES_CACHE_TTL)
+            return result
         
         # --- Data Sanitization and Transformation ---
         if 'anomaly_id' in df.columns:
@@ -139,11 +182,25 @@ def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: i
             if col in df.columns:
                 df[col] = df[col].replace([np.inf, -np.inf], np.nan)
 
-        return df.to_dict('records')
+        result = df.to_dict('records')
+        
+        # Cache the result with optimized TTL
+        cache_service.set(cache_key, result, ANOMALIES_CACHE_TTL)
+        logger.info(f"Cached {len(result)} anomalies for page {page}")
+        
+        return result
 
     except (GoogleAPICallError, Exception) as e:
-        print(f"An error occurred while fetching anomalies: {e}")
+        logger.error(f"An error occurred while fetching anomalies: {e}")
         return [{"error": str(e)}]
+    
+      
+def invalidate_anomalies_cache():
+    """
+    Invalidates all anomalies cache when data changes.
+    Uses pattern deletion to clear all pages.
+    """
+    return cache_service.delete_pattern(f"{PENDING_ANOMALIES_CACHE_KEY_PREFIX}*")
     
       
     
@@ -151,6 +208,7 @@ def get_pending_anomalies(bq_client: bigquery.Client, page: int = 1, per_page: i
 def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str, user_id: str):
     """
     Updates the status and reviewed_by_user_id of a specific anomaly in BigQuery.
+    Also invalidates related caches.
     """
     query = f"""
         UPDATE `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly`
@@ -168,9 +226,22 @@ def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str
     try:
         # Execute the query and wait for the job to complete
         bq_client.query(query, job_config=job_config).result()
+        
+        # Invalidate anomalies cache after resolution
+        invalidate_anomalies_cache()
+        
+        # Also invalidate dashboard stats as they might change
+        invalidate_dashboard_stats_cache()
+        
+        # Invalidate price history for this anomaly if it exists
+        cache_service.delete(f"{PRICE_HISTORY_CACHE_KEY_PREFIX}{anomaly_id}")
+        
+        # Invalidate admin activity cache
+        cache_service.delete(RECENT_ADMIN_ACTIVITY_CACHE_KEY)
+        
         return {"status": "success", "message": f"Anomaly {anomaly_id} resolved as {resolution}"}
     except GoogleAPICallError as e:
-        print(f"An error occurred while resolving anomaly {anomaly_id}: {e}")
+        logger.error(f"An error occurred while resolving anomaly {anomaly_id}: {e}")
         return {"error": str(e)}
 
 
@@ -178,9 +249,23 @@ def resolve_anomaly(bq_client: bigquery.Client, anomaly_id: int, resolution: str
 def get_category_distribution(bq_client: bigquery.Client, start_date: date, end_date: date) -> List[Dict[str, Any]]:
     """
     Fetches the distribution of products across different categories for a pie chart.
+    Uses caching for better performance.
     """
+    # Simplify cache key to increase hit rate - cache by date range in days instead of exact dates
+    days_range = (end_date - start_date).days
+    cache_key = f"{CATEGORY_DISTRIBUTION_CACHE_KEY_PREFIX}days:{days_range}"
+    
+    # Try to get from cache first
+    cached_distribution = cache_service.get(cache_key)
+    if cached_distribution is not None:
+        logger.info(f"Using cached category distribution for {days_range} days")
+        return cached_distribution
+        
+    logger.info(f"Cache miss for category distribution ({days_range} days), querying database")
+    
     try:
-        if bq_client is None: raise Exception("BigQuery client not provided.")
+        if bq_client is None: 
+            raise Exception("BigQuery client not provided.")
 
         # This query joins products with categories, filters by date,
         # groups by category name, and counts the products in each.
@@ -206,14 +291,20 @@ def get_category_distribution(bq_client: bigquery.Client, start_date: date, end_
         df = bq_client.query(query, job_config=job_config).to_dataframe()
 
         if df.empty:
-            return []
+            result = []
+            cache_service.set(cache_key, result, CATEGORY_DISTRIBUTION_CACHE_TTL)
+            return result
         
         # The frontend pie chart expects a 'name' and a 'value' for each slice.
-        # We can return the raw counts, and the frontend can calculate percentages for the labels.
-        return df.to_dict('records')
+        result = df.to_dict('records')
+        
+        # Cache the result
+        cache_service.set(cache_key, result, CATEGORY_DISTRIBUTION_CACHE_TTL)
+        
+        return result
 
     except (GoogleAPICallError, Exception) as e:
-        print(f"An error occurred while fetching category distribution: {e}")
+        logger.error(f"An error occurred while fetching category distribution: {e}")
         return [{"error": str(e)}]
 
 
@@ -221,8 +312,15 @@ def get_category_distribution(bq_client: bigquery.Client, start_date: date, end_
 def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_date: date) -> List[Dict[str, Any]]:
     """
     Fetches the top 10 most tracked products by users within a date range.
-    This version correctly joins Supabase 'variant_id' with BigQuery 'shop_product_id'.
+    Uses caching for better performance.
     """
+    cache_key = f"{TOP_TRACKED_PRODUCTS_CACHE_KEY_PREFIX}{start_date}:{end_date}"
+    
+    # Try to get from cache first
+    cached_products = cache_service.get(cache_key)
+    if cached_products is not None:
+        return cached_products
+    
     try:
         # Step 1: Query Supabase to get the top 10 product IDs and their favorite counts
         supabase = get_supabase_client()
@@ -232,7 +330,9 @@ def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_d
         
         top_products_data = top_products_response.data
         if not top_products_data:
-            return []
+            result = []
+            cache_service.set(cache_key, result, TOP_TRACKED_PRODUCTS_CACHE_TTL)
+            return result
 
         # Extract the shop_product_ids to use in the BigQuery query
         shop_product_ids = [item['shop_product_id_result'] for item in top_products_data]
@@ -241,7 +341,8 @@ def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_d
         user_counts = {item['shop_product_id_result']: item['user_count_result'] for item in top_products_data}
 
         # Step 2: Query BigQuery to get the product names for those shop_product_ids
-        if not bq_client: raise Exception("BigQuery client not provided.")
+        if not bq_client: 
+            raise Exception("BigQuery client not provided.")
 
         # This query is now much simpler and correct.
         query = f"""
@@ -259,7 +360,9 @@ def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_d
         product_names_df = bq_client.query(query, job_config=job_config).to_dataframe()
 
         if product_names_df.empty:
-            return []
+            result = []
+            cache_service.set(cache_key, result, TOP_TRACKED_PRODUCTS_CACHE_TTL)
+            return result
 
         # Step 3: Combine the results in Python
         # Add the 'userCount' to our DataFrame of product names
@@ -273,17 +376,28 @@ def get_top_tracked_products(bq_client: bigquery.Client, start_date: date, end_d
         
         # Sanitize data to prevent JSON errors
         final_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        return final_df.where(pd.notna(final_df), None).to_dict('records')
+        result = final_df.where(pd.notna(final_df), None).to_dict('records')
+        
+        # Cache the result
+        cache_service.set(cache_key, result, TOP_TRACKED_PRODUCTS_CACHE_TTL)
+        
+        return result
 
     except (GoogleAPICallError, Exception) as e:
-        print(f"An error occurred while fetching top tracked products: {e}")
+        logger.error(f"An error occurred while fetching top tracked products: {e}")
         return [{"error": str(e)}]
 
 # Function for getting the recent admin activities
 def get_recent_admin_activity() -> List[Dict[str, Any]]:
     """
-    Fetches the 5 most recent admin activities from the audit log table in Supabase.
+    Fetches the 10 most recent admin activities from the audit log table in Supabase.
+    Uses caching for better performance.
     """
+    # Try to get from cache first
+    cached_activities = cache_service.get(RECENT_ADMIN_ACTIVITY_CACHE_KEY)
+    if cached_activities is not None:
+        return cached_activities
+        
     try:
         supabase = get_supabase_client()
         
@@ -311,64 +425,204 @@ def get_recent_admin_activity() -> List[Dict[str, Any]]:
                 "timestamp": item['activity_timestamp']
             })
         
+        # Cache the result
+        cache_service.set(RECENT_ADMIN_ACTIVITY_CACHE_KEY, activities, RECENT_ADMIN_ACTIVITY_CACHE_TTL)
+        
         return activities
     except Exception as e:
-        print(f"An error occurred while fetching admin activity from Supabase: {e}")
+        logger.error(f"An error occurred while fetching admin activity from Supabase: {e}")
         return [{"error": str(e)}]
 
 
 # Function for getting the price history of an anomalous product
-def get_price_history_for_anomaly(bq_client: bigquery.Client, anomaly_id: int, days: int = 30) -> List[Dict[str, Any]]:
+def get_price_history_for_anomaly(bq_client: bigquery.Client, anomaly_id: int, days: int = 90) -> List[Dict[str, Any]]:
     """
-    Fetches the price history for the variant associated with a specific anomaly.
-    It performs a lookup to find the variant_id from the anomaly_id.
+    Fetches the price history for a product associated with a specific anomaly.
+    Uses caching for better performance.
     """
+    cache_key = f"{PRICE_HISTORY_CACHE_KEY_PREFIX}{anomaly_id}:{days}"
+    
+    # Try to get from cache first
+    cached_history = cache_service.get(cache_key)
+    if cached_history is not None:
+        return cached_history
+        
     try:
-        if bq_client is None: raise Exception("BigQuery client not provided.")
-
-        end_date = date.today()
-        start_date = end_date - timedelta(days=days - 1)
-
-        # This single, efficient query performs the exact lookup you described:
-        # Anomaly ID -> Price Fact ID -> Variant ID -> Price History
-        query = f"""
-            -- Step 2: Fetch the price history for the variant_id we found.
-            SELECT
-                d.full_date AS date,
-                fp.current_price AS price
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fp
-            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS d ON fp.date_id = d.date_id
-            WHERE
-                -- This subquery is the key. It finds the correct variant_id.
-                fp.variant_id = (
-                    SELECT price_table.variant_id
-                    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` AS anomaly_table
-                    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS price_table
-                        ON anomaly_table.price_fact_id = price_table.price_fact_id
-                    WHERE anomaly_table.anomaly_id = @anomaly_id
-                    LIMIT 1
-                )
-            AND d.full_date BETWEEN @start_date AND @end_date
-            ORDER BY d.full_date ASC
+        # First, we need to find the variant_id associated with this anomaly.
+        anomaly_query = f"""
+            SELECT 
+                fpa.price_fact_id,
+                fpp.variant_id
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactPriceAnomaly` AS fpa
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp
+                ON fpa.price_fact_id = fpp.price_fact_id
+            WHERE fpa.anomaly_id = @anomaly_id
         """
-        job_config = bigquery.QueryJobConfig(
+        
+        anomaly_job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("anomaly_id", "INT64", anomaly_id),
-                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
-                bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+                bigquery.ScalarQueryParameter("anomaly_id", "INT64", anomaly_id)
             ]
         )
-
-        df = bq_client.query(query, job_config=job_config).to_dataframe()
-
-        if df.empty:
-            return []
-
-        # Sanitize and convert to records
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        return df.where(pd.notna(df), None).to_dict('records')
-
+        
+        anomaly_df = bq_client.query(anomaly_query, job_config=anomaly_job_config).to_dataframe()
+        
+        if anomaly_df.empty:
+            logger.warning(f"No anomaly found with ID {anomaly_id}")
+            result = []
+            cache_service.set(cache_key, result, PRICE_HISTORY_CACHE_TTL)
+            return result
+            
+        variant_id = int(anomaly_df['variant_id'].iloc[0])
+        
+        # Now fetch the price history for this variant over the last 'days' days.
+        today = date.today()
+        start_date = today - timedelta(days=days)
+        
+        history_query = f"""
+            SELECT
+                dd.full_date AS date,
+                fpp.current_price AS price
+            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` AS fpp
+            JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` AS dd
+                ON fpp.date_id = dd.date_id
+            WHERE fpp.variant_id = @variant_id
+                AND dd.full_date BETWEEN @start_date AND @end_date
+            ORDER BY dd.full_date ASC
+        """
+        
+        history_job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("variant_id", "INT64", variant_id),
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end_date", "DATE", today)
+            ]
+        )
+        
+        history_df = bq_client.query(history_query, job_config=history_job_config).to_dataframe()
+        
+        if history_df.empty:
+            logger.warning(f"No price history found for variant {variant_id} in the last {days} days")
+            result = []
+            cache_service.set(cache_key, result, PRICE_HISTORY_CACHE_TTL)
+            return result
+        
+        # Convert to dictionary records for JSON serialization
+        # Make sure to handle any inf or NaN values
+        history_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        result = history_df.where(pd.notna(history_df), None).to_dict('records')
+        
+        # Cache the result
+        cache_service.set(cache_key, result, PRICE_HISTORY_CACHE_TTL)
+        
+        return result
+        
     except (GoogleAPICallError, Exception) as e:
-        print(f"An error occurred while fetching price history for anomaly {anomaly_id}: {e}")
+        logger.error(f"An error occurred while fetching price history for anomaly {anomaly_id}: {e}")
         return [{"error": str(e)}]
+
+
+def invalidate_all_admin_caches():
+    """
+    Invalidates all admin caches when there are major data changes.
+    """
+    cache_keys = [
+        DASHBOARD_STATS_CACHE_KEY,
+        f"{PENDING_ANOMALIES_CACHE_KEY_PREFIX}*",
+        f"{CATEGORY_DISTRIBUTION_CACHE_KEY_PREFIX}*",
+        f"{TOP_TRACKED_PRODUCTS_CACHE_KEY_PREFIX}*",
+        RECENT_ADMIN_ACTIVITY_CACHE_KEY,
+        f"{PRICE_HISTORY_CACHE_KEY_PREFIX}*"
+    ]
+    
+    success = True
+    for key_pattern in cache_keys:
+        if "*" in key_pattern:
+            if not cache_service.delete_pattern(key_pattern):
+                success = False
+        else:
+            if not cache_service.delete(key_pattern):
+                success = False
+                
+    return success
+
+
+# --- NEW FUNCTION TO PROMOTE A USER ---
+def promote_user_to_admin(user_id: str) -> Dict[str, Any]:
+    """
+    Assigns the 'Admin' role to a specific user.
+
+    This function is designed to be called by a protected admin endpoint.
+    It finds the role_id for 'Admin', checks for existing mappings,
+    and inserts a new record if one doesn't exist.
+
+    Args:
+        user_id: The UUID of the user to be promoted.
+
+    Returns:
+        A dictionary with the status and a message.
+    """
+    try:
+        logger.info(f"Attempting to promote user {user_id} to admin role")
+        
+        # Get Supabase client
+        try:
+            supabase = get_supabase_client()
+            logger.info("Successfully got Supabase client")
+        except Exception as client_error:
+            logger.error(f"Failed to get Supabase client: {client_error}")
+            return {"error": f"Database connection error: {str(client_error)}"}
+        
+        # Step 1: Find the role_id for the 'Admin' role.
+        try:
+            role_query = supabase.from_("roles").select("role_id").eq("role_name", "Admin").single()
+            role_response = role_query.execute()
+            
+            if not role_response.data:
+                logger.error("Critical: 'Admin' role not found in the roles table.")
+                return {"error": "Configuration error: Admin role not found."}
+                
+            admin_role_id = role_response.data['role_id']
+            logger.info(f"Found Admin role with ID: {admin_role_id}")
+        except Exception as role_error:
+            logger.error(f"Error querying for Admin role: {role_error}")
+            return {"error": f"Failed to query admin role: {str(role_error)}"}
+
+        # Step 2: Check if the user already has this role to prevent duplicates.
+        try:
+            mapping_query = supabase.from_("userrolemapping").select("user_id").eq("user_id", user_id).eq("role_id", admin_role_id)
+            mapping_response = mapping_query.execute()
+
+            if mapping_response.data:
+                logger.warning(f"Attempted to re-promote user {user_id} who is already an admin.")
+                return {"status": "success", "message": "User is already an administrator."}
+            
+            logger.info(f"User {user_id} is not yet an admin, proceeding with role assignment")
+        except Exception as mapping_error:
+            logger.error(f"Error checking existing role mappings: {mapping_error}")
+            return {"error": f"Failed to check existing roles: {str(mapping_error)}"}
+
+        # Step 3: Insert the new role mapping into the table.
+        try:
+            insert_query = supabase.from_("userrolemapping").insert({
+                "user_id": user_id,
+                "role_id": admin_role_id
+            })
+            insert_response = insert_query.execute()
+
+            # The response from an insert contains the inserted data in a list.
+            # If the list is empty, the insert likely failed.
+            if not insert_response.data:
+                 logger.error(f"Failed to insert admin role mapping for user {user_id}.")
+                 return {"error": "Database operation failed: Could not assign admin role."}
+
+            logger.info(f"Successfully promoted user {user_id} to an administrator.")
+            return {"status": "success", "message": f"User {user_id} promoted to administrator."}
+        except Exception as insert_error:
+            logger.error(f"Error inserting new role mapping: {insert_error}")
+            return {"error": f"Failed to assign admin role: {str(insert_error)}"}
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while promoting user {user_id}: {e}")
+        return {"error": f"An unexpected error occurred: {str(e)}"}
 
