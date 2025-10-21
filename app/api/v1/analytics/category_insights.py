@@ -1,14 +1,15 @@
 # app/api/v1/analytics/category_insights.py
 
 from fastapi import APIRouter, Query, Depends, HTTPException, Response
-from typing import Literal, Optional
+from typing import Literal
 from datetime import timedelta
 import logging
+from google.cloud import bigquery
+
 from app.schemas.analytics.category_insights import CategoryInsightsResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
 from app.services.cache_service import cache_service
-from app.services.async_query_service import async_query_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,16 +22,6 @@ def get_time_range_value(time_range: str) -> int:
     """Convert time range string to number of days"""
     mapping = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
     return mapping.get(time_range, 30)
-
-
-def sanitize_string_for_sql(input_str: str) -> str:
-    """
-    Sanitize a string to be used safely in SQL queries.
-    Replaces single quotes with two single quotes to prevent SQL injection.
-    """
-    if not input_str:
-        return ""
-    return input_str.replace("'", "''")
 
 
 @router.get("/category-insights", response_model=CategoryInsightsResponse, summary="Get category insights")
@@ -59,97 +50,114 @@ async def get_category_insights(
     
     try:
         # Build query with the appropriate filters
+        retailer_condition = "TRUE"
+        query_params = []
+        join_shop = f"LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id"
+
         if retailer == "all":
-            retailer_filter = "TRUE"
+            retailer_condition = "TRUE"
         elif retailer.isdigit():
-            retailer_filter = f"sp.shop_id = {retailer}"
+            retailer_condition = "sp.shop_id = @retailer_id"
+            query_params.append(bigquery.ScalarQueryParameter("retailer_id", "INT64", int(retailer)))
         else:
-            sanitized_retailer = sanitize_string_for_sql(retailer)
-            if not sanitized_retailer:
+            cleaned_retailer = retailer.strip()
+            if not cleaned_retailer:
                 raise ValueError("Retailer name cannot be empty")
-            retailer_filter = f"s.shop_name = '{sanitized_retailer}'"
-            
+            retailer_condition = "s.shop_name = @retailer_name"
+            query_params.append(bigquery.ScalarQueryParameter("retailer_name", "STRING", cleaned_retailer))
+
         time_range_value = get_time_range_value(time_range)
-        
+
         # SQL query for category insights
         query = f"""
-                WITH latest_available_date AS (
-                -- Find the most recent date with data in FactProductPrice
-                SELECT MAX(dd.date_id) as date_id, MAX(dd.full_date) as full_date
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd ON pp.date_id = dd.date_id
+                WITH filtered_products AS (
+                    SELECT
+                        v.variant_id,
+                        sp.shop_id,
+                        COALESCE(c.category_name, 'Uncategorized') AS category_name
+                    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v
+                    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+                        ON v.shop_product_id = sp.shop_product_id
+                    LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
+                        ON sp.predicted_master_category_id = c.category_id
+                    {join_shop}
+                    WHERE {retailer_condition}
                 ),
-                today_date AS (
-                SELECT date_id
-                FROM latest_available_date
+                latest_date AS (
+                    SELECT MAX(d.full_date) AS full_date
+                    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+                    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+                    JOIN filtered_products fp ON fp.variant_id = pp.variant_id
+                    WHERE pp.is_available = TRUE
                 ),
-                historical_date AS (
-                SELECT dd.date_id
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` dd
-                JOIN latest_available_date lad
-                ON dd.full_date = DATE_SUB(lad.full_date, INTERVAL {time_range_value} DAY)
+                current_snapshot AS (
+                    SELECT
+                        pp.variant_id,
+                        pp.current_price,
+                        pp.original_price
+                    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+                    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+                    JOIN latest_date ld ON d.full_date = ld.full_date
+                    WHERE pp.variant_id IN (SELECT variant_id FROM filtered_products)
+                ),
+                historical_reference AS (
+                    SELECT
+                        pp.variant_id,
+                        pp.current_price AS historical_price
+                    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+                    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+                    JOIN latest_date ld ON d.full_date <= DATE_SUB(ld.full_date, INTERVAL {time_range_value} DAY)
+                    WHERE pp.variant_id IN (SELECT variant_id FROM filtered_products)
+                    QUALIFY ROW_NUMBER() OVER (PARTITION BY pp.variant_id ORDER BY d.full_date DESC) = 1
+                ),
+                price_window AS (
+                    SELECT
+                        fp.variant_id,
+                        d.full_date,
+                        pp.current_price
+                    FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
+                    JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON pp.date_id = d.date_id
+                    JOIN latest_date ld ON d.full_date BETWEEN DATE_SUB(ld.full_date, INTERVAL {time_range_value} DAY) AND ld.full_date
+                    JOIN filtered_products fp ON fp.variant_id = pp.variant_id
                 ),
                 category_stats AS (
-                SELECT
-                    c.category_id,
-                    c.category_name,
-                    COUNT(DISTINCT v.variant_id) as product_count,
-                    AVG(current_pp.current_price) as current_avg_price,
-                    -- Fix division by zero in price change calculation
-                    AVG(
-                    CASE 
-                      WHEN historical_pp.current_price IS NOT NULL AND historical_pp.current_price > 0
-                      THEN (current_pp.current_price - historical_pp.current_price) / historical_pp.current_price * 100
-                      ELSE 0 
-                    END
-                    ) as price_change_pct,
-                    -- Fix division by zero in volatility calculation
-                    SAFE_DIVIDE(
-                      STDDEV(daily_pp.current_price), 
-                      NULLIF(AVG(daily_pp.current_price), 0)
-                    ) as price_volatility,
-                    COUNT(CASE WHEN current_pp.current_price < historical_pp.current_price THEN 1 END) as deal_count
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
-                    ON c.category_id = sp.predicted_master_category_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v
-                    ON sp.shop_product_id = v.shop_product_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s
-                    ON sp.shop_id = s.shop_id
-                CROSS JOIN today_date td
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` current_pp
-                    ON v.variant_id = current_pp.variant_id
-                AND current_pp.date_id = td.date_id
-                CROSS JOIN historical_date hd
-                LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` historical_pp
-                    ON v.variant_id = historical_pp.variant_id
-                AND historical_pp.date_id = hd.date_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` daily_pp
-                    ON v.variant_id = daily_pp.variant_id
-                JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d
-                    ON daily_pp.date_id = d.date_id
-                JOIN latest_available_date lad2 ON 1=1
-                AND d.full_date BETWEEN DATE_SUB(lad2.full_date, INTERVAL {time_range_value} DAY) AND lad2.full_date
-                WHERE current_pp.is_available = TRUE
-                    AND {retailer_filter}
-                GROUP BY c.category_id, c.category_name
+                    SELECT
+                        fp.category_name,
+                        COUNT(DISTINCT fp.variant_id) AS product_count,
+                        AVG(cs.current_price) AS current_avg_price,
+                        AVG(
+                            CASE
+                                WHEN hr.historical_price IS NOT NULL AND hr.historical_price > 0
+                                THEN (cs.current_price - hr.historical_price) / hr.historical_price * 100
+                                ELSE 0
+                            END
+                        ) AS price_change_pct,
+                        SAFE_DIVIDE(STDDEV(pw.current_price), NULLIF(AVG(pw.current_price), 0)) AS price_volatility,
+                        COUNTIF(hr.historical_price IS NOT NULL AND cs.current_price < hr.historical_price) AS deal_count
+                    FROM filtered_products fp
+                    JOIN current_snapshot cs ON fp.variant_id = cs.variant_id
+                    LEFT JOIN historical_reference hr ON fp.variant_id = hr.variant_id
+                    LEFT JOIN price_window pw ON fp.variant_id = pw.variant_id
+                    GROUP BY fp.category_name
                 )
                 SELECT
-                category_name,
-                ROUND(current_avg_price, 2) as avg_price,
-                ROUND(price_change_pct, 2) as price_change,
-                ROUND(price_volatility, 2) as price_volatility,
-                product_count,
-                deal_count
+                    category_name,
+                    ROUND(current_avg_price, 2) AS avg_price,
+                    ROUND(price_change_pct, 2) AS price_change,
+                    ROUND(price_volatility, 4) AS price_volatility,
+                    product_count,
+                    deal_count
                 FROM category_stats
-                ORDER BY deal_count DESC
+                ORDER BY deal_count DESC, product_count DESC
                 LIMIT 10
-        """
-        
+                """
+
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+
         # Execute query
-        query_job = bq_client.query(query)
+        query_job = bq_client.query(query, job_config=job_config)
         results = list(query_job.result())
-        
+
         # Get the date that was used for analysis (for logging)
         date_query = f"""
         WITH latest_available_date AS (
@@ -160,29 +168,68 @@ async def get_category_insights(
         SELECT full_date FROM latest_available_date
         """
         date_result = list(bq_client.query(date_query).result())
-        if date_result and hasattr(date_result[0], 'full_date'):
+        if date_result and hasattr(date_result[0], "full_date"):
             print(f"Category insights using data from: {date_result[0].full_date}")
             historical_date = date_result[0].full_date - timedelta(days=time_range_value)
             print(f"Historical comparison date: {historical_date}")
-        
+
         # Transform into response format
-        insights = [
-            {
-                "category_name": item.category_name,
-                "avg_price": item.avg_price,
-                "price_change": item.price_change,
-                "price_volatility": item.price_volatility,
-                "product_count": item.product_count,
-                "deal_count": item.deal_count
-            }
-            for item in results
-        ]
-        
+        insights = []
+        for item in results:
+            if isinstance(item, dict):
+                insights.append(
+                    {
+                        "category_name": item.get("category_name"),
+                        "avg_price": item.get("avg_price", 0),
+                        "price_change": item.get("price_change", 0),
+                        "price_volatility": item.get("price_volatility", 0),
+                        "product_count": item.get("product_count", 0),
+                        "deal_count": item.get("deal_count", 0),
+                    }
+                )
+                continue
+
+            category_name = getattr(item, "category_name", None)
+            if category_name is None and hasattr(item, "__getitem__"):
+                try:
+                    category_name = item["category_name"]
+                except (KeyError, TypeError):
+                    category_name = None
+
+            avg_price = getattr(item, "avg_price", 0)
+            price_change = getattr(item, "price_change", 0)
+            price_volatility = getattr(item, "price_volatility", 0)
+            product_count = getattr(item, "product_count", 0)
+            deal_count = getattr(item, "deal_count", 0)
+
+            insights.append(
+                {
+                    "category_name": category_name,
+                    "avg_price": avg_price,
+                    "price_change": price_change,
+                    "price_volatility": price_volatility,
+                    "product_count": product_count,
+                    "deal_count": deal_count,
+                }
+            )
+
+        if not insights:
+            insights.append(
+                {
+                    "category_name": "No data",
+                    "avg_price": 0,
+                    "price_change": 0,
+                    "price_volatility": 0,
+                    "product_count": 0,
+                    "deal_count": 0,
+                }
+            )
+
         response_data = {"insights": insights}
-        
+
         # Cache the result for 30 minutes (1800 seconds)
         cache_service.set(cache_key, response_data, ttl_seconds=1800)
-        
+
         return response_data
         
     except ValueError as ve:

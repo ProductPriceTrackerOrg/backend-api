@@ -1,13 +1,14 @@
 # app/api/v1/analytics/market_summary.py
 
 from fastapi import APIRouter, Query, Depends, HTTPException, Response
-from typing import Literal, Optional, List
+from typing import Literal
 import logging
+from google.cloud import bigquery
+
 from app.schemas.analytics.market_summary import MarketSummaryResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
 from app.services.cache_service import cache_service
-from app.services.async_query_service import async_query_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,16 +21,6 @@ def get_time_range_value(time_range: str) -> int:
     """Convert time range string to number of days"""
     mapping = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
     return mapping.get(time_range, 30)
-
-
-def sanitize_string_for_sql(input_str: str) -> str:
-    """
-    Sanitize a string to be used safely in SQL queries.
-    Replaces single quotes with two single quotes to prevent SQL injection.
-    """
-    if not input_str:
-        return ""
-    return input_str.replace("'", "''")
 
 
 @router.get("/market-summary", response_model=MarketSummaryResponse, summary="Get market summary data")
@@ -51,110 +42,128 @@ async def get_market_summary(
     """
     # Cache key based on parameters
     cache_key = f"market_summary:{category}:{retailer}:{time_range}:{max_categories}"
-    
-    # Try to get from cache first
+
     cached_data = cache_service.get(cache_key)
     if cached_data:
         return cached_data
-    
+
     try:
-        # Build query with the appropriate filters
-        if category == "all":
-            category_filter = "TRUE"
-        elif category.isdigit():
-            # If category is a numeric ID
-            category_filter = f"sp.predicted_master_category_id = {category}"
-        else:
-            # If category is a name string, join with the category table
-            sanitized_category = sanitize_string_for_sql(category)
-            if not sanitized_category:
-                raise ValueError("Category name cannot be empty")
-            category_filter = f"c.category_name = '{sanitized_category}'"
-        
-        if retailer == "all":
-            retailer_filter = "TRUE"
-        elif retailer.isdigit():
-            retailer_filter = f"sp.shop_id = {retailer}"
-        else:
-            sanitized_retailer = sanitize_string_for_sql(retailer)
-            if not sanitized_retailer:
-                raise ValueError("Retailer name cannot be empty")
-            retailer_filter = f"s.shop_name = '{sanitized_retailer}'"
-            
         time_range_value = get_time_range_value(time_range)
-        
-        # SQL query for market summary
+
+        # Build filter conditions and query parameters
+        category_condition = "TRUE"
+        retailer_condition = "TRUE"
+        query_params = []
+        join_category = f"LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id"
+        join_shop = f"LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id"
+
+        if category == "all":
+            category_condition = "TRUE"
+        elif category.isdigit():
+            category_condition = "sp.predicted_master_category_id = @category_id"
+            query_params.append(bigquery.ScalarQueryParameter("category_id", "INT64", int(category)))
+        else:
+            cleaned_category = category.strip()
+            if not cleaned_category:
+                raise ValueError("Category name cannot be empty")
+            category_condition = "c.category_name = @category_name"
+            query_params.append(bigquery.ScalarQueryParameter("category_name", "STRING", cleaned_category))
+
+        if retailer == "all":
+            retailer_condition = "TRUE"
+        elif retailer.isdigit():
+            retailer_condition = "sp.shop_id = @retailer_id"
+            query_params.append(bigquery.ScalarQueryParameter("retailer_id", "INT64", int(retailer)))
+        else:
+            cleaned_retailer = retailer.strip()
+            if not cleaned_retailer:
+                raise ValueError("Retailer name cannot be empty")
+            retailer_condition = "s.shop_name = @retailer_name"
+            query_params.append(bigquery.ScalarQueryParameter("retailer_name", "STRING", cleaned_retailer))
+
         query = f"""
-        WITH sample_data_check AS (
-          -- Check if we have any data in the tables at all
-          SELECT COUNT(*) as product_count
-          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant`
-          LIMIT 1
+        WITH filtered_products AS (
+          SELECT
+            v.variant_id,
+            sp.shop_id,
+            sp.predicted_master_category_id,
+            COALESCE(c.category_name, 'Uncategorized') AS category_name
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp
+            ON v.shop_product_id = sp.shop_product_id
+          {join_category}
+          {join_shop}
+          WHERE {category_condition}
+            AND {retailer_condition}
         ),
-        current_date_id AS (
-          SELECT date_id 
-          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate`
-          WHERE full_date = CURRENT_DATE()
+        latest_date AS (
+          SELECT MAX(d.full_date) AS full_date
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON fpp.date_id = d.date_id
+          JOIN filtered_products fp ON fp.variant_id = fpp.variant_id
+          WHERE fpp.is_available = TRUE
         ),
-        historical_date_id AS (
-          SELECT date_id 
-          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate`
-          WHERE full_date = DATE_SUB(CURRENT_DATE(), INTERVAL {time_range_value} DAY)
+        current_prices AS (
+          SELECT
+            fpp.variant_id,
+            fpp.current_price,
+            fpp.original_price
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON fpp.date_id = d.date_id
+          JOIN latest_date ld ON d.full_date = ld.full_date
+          WHERE fpp.variant_id IN (SELECT variant_id FROM filtered_products)
+        ),
+        historical_prices AS (
+          SELECT
+            fpp.variant_id,
+            fpp.current_price AS historical_price
+          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` fpp
+          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate` d ON fpp.date_id = d.date_id
+          JOIN latest_date ld ON d.full_date <= DATE_SUB(ld.full_date, INTERVAL {time_range_value} DAY)
+          WHERE fpp.variant_id IN (SELECT variant_id FROM filtered_products)
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY fpp.variant_id ORDER BY d.full_date DESC) = 1
+        ),
+        active_products AS (
+          SELECT
+            fp.variant_id,
+            fp.shop_id,
+            fp.category_name,
+            cp.current_price,
+            cp.original_price
+          FROM filtered_products fp
+          JOIN current_prices cp ON fp.variant_id = cp.variant_id
         ),
         market_metrics AS (
           SELECT
-            COALESCE(COUNT(DISTINCT v.variant_id), 0) as total_products,
-            COALESCE(COUNT(DISTINCT sp.shop_id), 0) as total_shops,
-            COALESCE(
-              AVG(
-                CASE WHEN historical_pp.current_price IS NOT NULL AND historical_pp.current_price != 0
-                THEN (current_pp.current_price - historical_pp.current_price) / historical_pp.current_price * 100
-                ELSE 0 END
-              ), 
-              0
-            ) as avg_price_change,
-            (COUNT(CASE WHEN current_pp.current_price < historical_pp.current_price THEN 1 END) * 100.0 /
-              NULLIF(COUNT(v.variant_id), 0)) as price_drop_percentage
-          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v
-          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON v.shop_product_id = sp.shop_product_id
-          {f'JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c ON sp.predicted_master_category_id = c.category_id' if not category.isdigit() and category != 'all' else ''}
-          {f'JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id' if not retailer.isdigit() and retailer != 'all' else ''}
-          -- Current prices (today)
-          JOIN current_date_id cdi ON 1=1
-          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` current_pp
-            ON v.variant_id = current_pp.variant_id
-            AND current_pp.date_id = cdi.date_id
-          -- Historical prices (for comparison)
-          LEFT JOIN historical_date_id hdi ON 1=1
-          LEFT JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` historical_pp
-            ON v.variant_id = historical_pp.variant_id
-            AND historical_pp.date_id = hdi.date_id
-          WHERE
-            current_pp.is_available = TRUE
-            AND {category_filter}
-            AND {retailer_filter}
+            COUNT(DISTINCT ap.variant_id) AS total_products,
+            COUNT(DISTINCT ap.shop_id) AS total_shops,
+            AVG(
+              CASE
+                WHEN hp.historical_price IS NOT NULL AND hp.historical_price != 0
+                THEN (ap.current_price - hp.historical_price) / hp.historical_price * 100
+                ELSE 0
+              END
+            ) AS avg_price_change,
+            COUNTIF(hp.historical_price IS NOT NULL AND ap.current_price < hp.historical_price) * 100.0 /
+              NULLIF(COUNT(ap.variant_id), 0) AS price_drop_percentage
+          FROM active_products ap
+          LEFT JOIN historical_prices hp ON ap.variant_id = hp.variant_id
+        ),
+        category_counts AS (
+          SELECT
+            ap.category_name,
+            COUNT(DISTINCT ap.variant_id) AS product_count
+          FROM active_products ap
+          GROUP BY ap.category_name
         ),
         category_distribution AS (
           SELECT
-            c.category_name,
-            COUNT(DISTINCT v.variant_id) as product_count,
-            ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT v.variant_id) DESC) as category_rank
-          FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimCategory` c
-          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShopProduct` sp ON c.category_id = sp.predicted_master_category_id
-          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimVariant` v ON sp.shop_product_id = v.shop_product_id
-          {f'JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimShop` s ON sp.shop_id = s.shop_id' if not retailer.isdigit() and retailer != 'all' else ''}
-          JOIN current_date_id cdi ON 1=1
-          JOIN `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.FactProductPrice` pp
-            ON v.variant_id = pp.variant_id
-            AND pp.date_id = cdi.date_id
-          WHERE
-            pp.is_available = TRUE
-            AND {retailer_filter}
-          GROUP BY c.category_name
-          ORDER BY product_count DESC
-          LIMIT {max_categories}
+            category_name,
+            product_count,
+            ROW_NUMBER() OVER (ORDER BY product_count DESC) AS category_rank
+          FROM category_counts
         ),
-        top_categories AS (
+        category_breakdown AS (
           SELECT
             category_name,
             product_count,
@@ -165,157 +174,126 @@ async def get_market_summary(
               WHEN category_rank = 3 THEN '#F59E0B'
               WHEN category_rank = 4 THEN '#EF4444'
               ELSE '#8B5CF6'
-            END as color
+            END AS color
           FROM category_distribution
+          WHERE category_rank <= {max_categories}
         )
         SELECT
-          mm.total_products,
-          mm.total_shops,
-          ROUND(mm.avg_price_change, 2) as average_price_change,
-          ROUND(mm.price_drop_percentage, 2) as price_drop_percentage,
-          -- Calculate buying score based on price drops and availability
+          COALESCE(mm.total_products, 0) AS total_products,
+          COALESCE(mm.total_shops, 0) AS total_shops,
+          ROUND(COALESCE(mm.avg_price_change, 0), 2) AS average_price_change,
+          ROUND(COALESCE(mm.price_drop_percentage, 0), 2) AS price_drop_percentage,
           CASE
-            WHEN mm.avg_price_change < -5 AND mm.price_drop_percentage > 40 THEN 85
-            WHEN mm.avg_price_change < -3 AND mm.price_drop_percentage > 30 THEN 75
-            WHEN mm.avg_price_change < 0 THEN 65
-            WHEN mm.avg_price_change < 3 THEN 45
+            WHEN COALESCE(mm.avg_price_change, 0) < -5 AND COALESCE(mm.price_drop_percentage, 0) > 40 THEN 85
+            WHEN COALESCE(mm.avg_price_change, 0) < -3 AND COALESCE(mm.price_drop_percentage, 0) > 30 THEN 75
+            WHEN COALESCE(mm.avg_price_change, 0) < 0 THEN 65
+            WHEN COALESCE(mm.avg_price_change, 0) < 3 THEN 45
             ELSE 30
-          END as best_buying_score,
-          ARRAY_AGG(
-            STRUCT(
-              tc.category_name as name,
-              tc.product_count as value,
-              tc.color as color
-            )
-            ORDER BY tc.category_rank ASC
-          ) as category_distribution
+          END AS best_buying_score,
+          ARRAY(
+            SELECT AS STRUCT
+              cb.category_name AS name,
+              cb.product_count AS value,
+              cb.color AS color
+            FROM category_breakdown cb
+            ORDER BY cb.category_rank
+          ) AS category_distribution
         FROM market_metrics mm
-        CROSS JOIN top_categories tc
-        GROUP BY mm.total_products, mm.total_shops, mm.avg_price_change, mm.price_drop_percentage
         """
-        
-        # Execute query
-        try:
-            # First check if the date_id exists
-            date_check_query = f"""
-            SELECT COUNT(*) as date_count 
-            FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate`
-            WHERE full_date = CURRENT_DATE()
-            """
-            date_check_job = bq_client.query(date_check_query)
-            date_check_result = list(date_check_job.result())[0]
-            
-            if date_check_result.date_count == 0:
-                # We're missing date entries for today, so we'll use the most recent date instead
-                latest_date_query = f"""
-                SELECT MAX(full_date) as latest_date
-                FROM `{settings.GCP_PROJECT_ID}.{settings.BIGQUERY_DATASET_ID}.DimDate`
-                """
-                latest_date_job = bq_client.query(latest_date_query)
-                latest_date = list(latest_date_job.result())[0].latest_date
-                
-                # Update the main query with the latest date
-                query = query.replace("CURRENT_DATE()", f"DATE('{latest_date}')")
-            
-            # Now execute the main query
-            query_job = bq_client.query(query)
-            results = list(query_job.result())
-            
-            # Handle case where no results were found
-            if not results:
-                return {
-                    "summary": {
-                        "total_products": 0,
-                        "total_shops": 0,
-                        "average_price_change": 0.0,
-                        "price_drop_percentage": 0.0,
-                        "best_buying_score": 0,
-                        "category_distribution": []
-                    }
+
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        query_job = bq_client.query(query, job_config=job_config)
+        results = list(query_job.result())
+
+        if not results:
+            response_data = {
+                "summary": {
+                    "total_products": 0,
+                    "total_shops": 0,
+                    "average_price_change": 0.0,
+                    "price_drop_percentage": 0.0,
+                    "best_buying_score": 0,
+                    "category_distribution": []
                 }
-                
-            result = results[0]
-        except Exception as e:
-            # Add more detailed error handling for BigQuery issues
-            raise HTTPException(
-                status_code=500, 
-                detail=f"BigQuery execution error: {str(e)}"
-            )
-        
-        # Transform into response format
-        # Handle category distribution conversion from BigQuery ARRAY to Python list
-        category_distribution = []
-        
-        # Check if category_distribution exists and is not None
-        if hasattr(result, 'category_distribution') and result.category_distribution is not None:
-            try:
-                for item in result.category_distribution:
-                    # Handle different ways items might be represented in the BigQuery response
-                    item_dict = {}
-                    if hasattr(item, '__dict__'):  # If it's an object we can convert to dict
-                        item_dict = {
-                            "name": getattr(item, 'name', None),
-                            "value": getattr(item, 'value', 0),
-                            "color": getattr(item, 'color', '#3B82F6')
-                        }
-                    elif isinstance(item, dict):  # If it's already a dict
-                        item_dict = {
-                            "name": item.get('name', None),
-                            "value": item.get('value', 0),
-                            "color": item.get('color', '#3B82F6')
-                        }
-                    else:
-                        # Try other ways to access data
-                        try:
-                            # Some BigQuery results provide dict-like access without being a dict
-                            item_dict = {
-                                "name": item['name'] if 'name' in item else None,
-                                "value": item['value'] if 'value' in item else 0,
-                                "color": item['color'] if 'color' in item else '#3B82F6'
-                            }
-                        except (TypeError, KeyError):
-                            print(f"Could not process category item: {item}, type: {type(item)}")
-                            continue
-                    
-                    # Only add if we have a name
-                    if item_dict.get("name") is not None:
-                        category_distribution.append(item_dict)
-            except Exception as e:
-                print(f"Error processing category distribution: {e}")
-                # In case of any error, provide empty category distribution
-                category_distribution = []
-        
-        response_data = {
-            "summary": {
-                "total_products": result.total_products,
-                "total_shops": result.total_shops,
-                "average_price_change": result.average_price_change,
-                "price_drop_percentage": result.price_drop_percentage,
-                "best_buying_score": result.best_buying_score,
-                "category_distribution": category_distribution
             }
-        }
-        
-        # Cache the result for 15 minutes (900 seconds)
+        else:
+            result = results[0]
+
+            def _extract_field(row, field, default=0):
+                if isinstance(row, dict):
+                    return row.get(field, default)
+                if hasattr(row, "__getitem__"):
+                    try:
+                        return row[field]
+                    except (KeyError, TypeError):
+                        pass
+                return getattr(row, field, default)
+
+            category_distribution = []
+            distribution_rows = getattr(result, "category_distribution", None)
+            if distribution_rows:
+                for item in distribution_rows:
+                    if isinstance(item, dict):
+                        category_distribution.append({
+                            "name": item.get("name"),
+                            "value": item.get("value", 0),
+                            "color": item.get("color", "#3B82F6")
+                        })
+                        continue
+
+                    # Handle BigQuery Row objects
+                    name = None
+                    value = 0
+                    color = "#3B82F6"
+
+                    if hasattr(item, "__getitem__"):
+                        try:
+                            name = item["name"]
+                            value = item.get("value", 0) if hasattr(item, "get") else item["value"]
+                            color = item.get("color", "#3B82F6") if hasattr(item, "get") else item["color"]
+                        except (KeyError, TypeError):
+                            pass
+
+                    if name is None:
+                        name = getattr(item, "name", None)
+                        value = getattr(item, "value", 0)
+                        color = getattr(item, "color", "#3B82F6")
+
+                    if name is not None:
+                        category_distribution.append({
+                            "name": name,
+                            "value": value,
+                            "color": color
+                        })
+
+            response_data = {
+                "summary": {
+                    "total_products": _extract_field(result, "total_products", 0) or 0,
+                    "total_shops": _extract_field(result, "total_shops", 0) or 0,
+                    "average_price_change": _extract_field(result, "average_price_change", 0) or 0,
+                    "price_drop_percentage": _extract_field(result, "price_drop_percentage", 0) or 0,
+                    "best_buying_score": _extract_field(result, "best_buying_score", 0) or 0,
+                    "category_distribution": category_distribution
+                }
+            }
+
         cache_service.set(cache_key, response_data, ttl_seconds=900)
-        
         return response_data
-        
+
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=f"Invalid input parameter: {str(ve)}")
+
     except Exception as e:
         error_message = str(e)
         if "Unrecognized name" in error_message and category != "all" and not category.isdigit():
-            # Provide a more helpful error message for category name issues
             raise HTTPException(
-                status_code=404, 
+                status_code=404,
                 detail=f"Category '{category}' not found. Please verify the category name or use a category ID instead."
             )
-        elif "Unrecognized name" in error_message and retailer != "all" and not retailer.isdigit():
-            # Provide a more helpful error message for retailer name issues
+        if "Unrecognized name" in error_message and retailer != "all" and not retailer.isdigit():
             raise HTTPException(
-                status_code=404, 
+                status_code=404,
                 detail=f"Retailer '{retailer}' not found. Please verify the retailer name or use a retailer ID instead."
             )
-        else:
-            raise HTTPException(status_code=500, detail=f"Error retrieving market summary data: {error_message}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving market summary data: {error_message}")
+        
