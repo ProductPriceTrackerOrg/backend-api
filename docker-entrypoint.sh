@@ -20,5 +20,5 @@ echo "GCP Project: ${GCP_PROJECT_ID:-not set}"
 echo "BigQuery Dataset: ${BIGQUERY_DATASET_ID:-not set}"
 
 # Start the application
-echo "Starting gunicorn server with ${WORKER_COUNT:-4} workers..."
-exec gunicorn -w ${WORKER_COUNT:-4} -k uvicorn.workers.UvicornWorker --timeout 120 --worker-connections=1000 --backlog=2048 -b 0.0.0.0:${PORT:-8000} app.main:app
+echo "Starting gunicorn server with ${WORKER_COUNT:-6} workers..."
+exec gunicorn -w ${WORKER_COUNT:-6} -k uvicorn.workers.UvicornWorker --timeout 120 --worker-connections=1000 --backlog=2048 -b 0.0.0.0:${PORT:-8000} app.main:app

@@ -1,11 +1,18 @@
 # app/api/v1/analytics/category_insights.py
 
-from fastapi import APIRouter, Query, Depends, HTTPException
+from fastapi import APIRouter, Query, Depends, HTTPException, Response
 from typing import Literal, Optional
 from datetime import timedelta
+import logging
 from app.schemas.analytics.category_insights import CategoryInsightsResponse
 from app.config import settings
 from app.api.deps import get_bigquery_client
+from app.services.cache_service import cache_service
+from app.services.async_query_service import async_query_service
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -28,6 +35,7 @@ def sanitize_string_for_sql(input_str: str) -> str:
 
 @router.get("/category-insights", response_model=CategoryInsightsResponse, summary="Get category insights")
 async def get_category_insights(
+    response: Response,
     time_range: Literal["7d", "30d", "90d", "1y"] = "30d",
     retailer: str = "all",
     bq_client=Depends(get_bigquery_client),
@@ -41,6 +49,14 @@ async def get_category_insights(
     - **time_range**: The time period for analysis (7d, 30d, 90d, 1y)
     - **retailer**: Shop ID or name, or "all" for all retailers
     """
+    # Cache key based on parameters
+    cache_key = f"category_insights:{retailer}:{time_range}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+    
     try:
         # Build query with the appropriate filters
         if retailer == "all":
@@ -162,7 +178,12 @@ async def get_category_insights(
             for item in results
         ]
         
-        return {"insights": insights}
+        response_data = {"insights": insights}
+        
+        # Cache the result for 30 minutes (1800 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=1800)
+        
+        return response_data
         
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=f"Invalid input parameter: {str(ve)}")

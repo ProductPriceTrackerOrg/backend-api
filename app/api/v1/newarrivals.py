@@ -9,6 +9,7 @@ from app.schemas.new_arrival import (
     NewArrivalsListResponse,
 )
 from app.api.deps import get_bigquery_client
+from app.services.cache_service import cache_service
 import logging
 
 # Configure logging
@@ -487,6 +488,15 @@ def get_new_arrivals_endpoint(
 
     ARRIVAL_DATE FORMAT: The arrival_date field contains dates in YYYYMMDD format (e.g., "20250826")
     """
+    # Create cache key based on all query parameters
+    cache_key = f"newarrivals:list:{query.timeRange}:{query.category or 'all'}:{query.retailer or 'all'}:{query.minPrice or 'none'}:{query.maxPrice or 'none'}:{query.sortBy}:{query.inStockOnly}:{query.limit}:{query.page}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        # Reconstruct the Pydantic model from cached dict
+        return NewArrivalsListResponse(**cached_data)
+        
     try:
         arrivals, _ = get_new_arrivals(query, bq_client)
 
@@ -494,13 +504,18 @@ def get_new_arrivals_endpoint(
         total = len(arrivals)
         has_next = len(arrivals) == query.limit
 
-        return NewArrivalsListResponse(
-            items=arrivals,
-            total=total,
-            page=query.page,
-            limit=query.limit,
-            has_next=has_next,
-        )
+        response_data = {
+            "items": [arrival.dict() for arrival in arrivals],  # Convert to dict for JSON serialization
+            "total": total,
+            "page": query.page,
+            "limit": query.limit,
+            "has_next": has_next,
+        }
+        
+        # Cache the results for 30 minutes
+        cache_service.set(cache_key, response_data, 1800)
+        
+        return NewArrivalsListResponse(**response_data)
     except HTTPException:
         raise
     except Exception as e:
@@ -517,8 +532,28 @@ def get_new_arrivals_stats_endpoint(
     bq_client: bigquery.Client = Depends(get_bigquery_client),
 ):
     """Get statistics for new arrivals with the same filtering logic as the main endpoint"""
+    # Create cache key based on all query parameters (excluding pagination since stats don't use it)
+    cache_key = f"newarrivals:stats:{query.timeRange}:{query.category or 'all'}:{query.retailer or 'all'}:{query.minPrice or 'none'}:{query.maxPrice or 'none'}:{query.inStockOnly}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        # Reconstruct the Pydantic model from cached dict
+        from app.schemas.new_arrival import NewArrivalsStats
+        return NewArrivalsStats(**cached_data)
+        
     try:
         _, stats = get_new_arrivals(query, bq_client)
+        
+        # Cache the results for 30 minutes (cache the dict representation)
+        stats_dict = {
+            "total_new_arrivals": stats.total_new_arrivals,
+            "average_price": stats.average_price,
+            "in_stock_count": stats.in_stock_count,
+            "category_count": stats.category_count,
+        }
+        cache_service.set(cache_key, stats_dict, 1800)
+        
         return stats
     except HTTPException:
         raise

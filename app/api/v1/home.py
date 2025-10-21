@@ -191,6 +191,14 @@ async def get_home_categories(
     """
     Get product categories with product counts and trending scores.
     """
+    # Cache key based on limit
+    cache_key = f"home:categories:{limit}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         query = f"""
         -- This query is designed to get the top trending parent categories
@@ -303,8 +311,13 @@ async def get_home_categories(
                 category['product_count'] = f"{round(count / 1000, 1)}K+"
             else:
                 category['product_count'] = f"{count}+"
+        
+        response_data = {"categories": results}
+        
+        # Cache the data for 1 hour (3600 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=3600)
                 
-        return {"categories": results}
+        return response_data
         
     except Exception as e:
         raise HTTPException(
@@ -323,6 +336,14 @@ async def get_trending_products(
     """
     Get trending products or new product launches.
     """
+    # Cache key based on parameters
+    cache_key = f"home:trending:{type}:{limit}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         if type == "trends":
             query = f"""
@@ -403,7 +424,7 @@ async def get_trending_products(
             query_job = bq_client.query(query)
             results = [dict(row) for row in query_job.result()]
             
-            return {
+            response_data = {
                 "products": results,
                 "stats": {
                     "trending_searches": "2.5M+",
@@ -411,6 +432,11 @@ async def get_trending_products(
                     "update_frequency": "Real-time"
                 }
             }
+            
+            # Cache the data for 30 minutes (1800 seconds)
+            cache_service.set(cache_key, response_data, ttl_seconds=1800)
+            
+            return response_data
         else:  # type == "launches"
             query = f"""
             WITH
@@ -481,7 +507,7 @@ async def get_trending_products(
             query_job = bq_client.query(query)
             results = [dict(row) for row in query_job.result()]
             
-            return {
+            response_data = {
                 "products": results,
                 "stats": {
                     "new_launches": "450+",
@@ -489,6 +515,11 @@ async def get_trending_products(
                     "tracking_type": "Pre-order"
                 }
             }
+            
+            # Cache the data for 2 hours (7200 seconds)
+            cache_service.set(cache_key, response_data, ttl_seconds=7200)
+            
+            return response_data
         
     except Exception as e:
         raise HTTPException(
@@ -506,6 +537,14 @@ async def get_latest_products(
     """
     Get the latest products added to the database.
     """
+    # Cache key based on limit
+    cache_key = f"home:latest:{limit}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         query = f"""
         WITH
@@ -595,7 +634,12 @@ async def get_latest_products(
             if 'added_date' in product and not isinstance(product['added_date'], str):
                 product['added_date'] = str(product['added_date'])
         
-        return {"products": results}
+        response_data = {"products": results}
+        
+        # Cache the data for 1 hour (3600 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=3600)
+        
+        return response_data
         
     except Exception as e:
         raise HTTPException(
@@ -606,6 +650,7 @@ async def get_latest_products(
 
 @router.get("/price-changes", response_model=PriceChangeResponse)
 async def get_price_changes(
+    response: Response,
     limit: int = Query(8, ge=1, le=50),
     type: str = Query("drops", regex="^(drops|increases)$"),
     bq_client: bigquery.Client = Depends(get_bigquery_client)
@@ -613,6 +658,14 @@ async def get_price_changes(
     """
     Get products with the most significant price drops or increases from the last available day.
     """
+    # Cache key based on parameters
+    cache_key = f"home:price-changes:{type}:{limit}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         # The dynamic filter for drops or increases
         change_filter = "pc.percentage_change < 0" if type == "drops" else "pc.percentage_change > 0"
@@ -701,7 +754,12 @@ async def get_price_changes(
             if "in_stock" not in row:
                 row["in_stock"] = True
 
-        return {"price_changes": results}
+        response_data = {"price_changes": results}
+        
+        # Cache the data for 30 minutes (1800 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=1800)
+        
+        return response_data
 
     except Exception as e:
         logger.error(f"Error fetching price changes: {e}")
@@ -720,6 +778,14 @@ async def get_featured_retailers(
     """
     Get featured retailers with product counts and ratings.
     """
+    # Cache key based on limit
+    cache_key = f"home:retailers:{limit}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     try:
         query = f"""
         SELECT
@@ -729,7 +795,7 @@ async def get_featured_retailers(
             s.contact_phone,
             s.contact_whatsapp,
             COUNT(DISTINCT v.variant_id) as product_count,
-            4.0 + RAND() * 1.0 as avg_rating,
+            ROUND(4.0 + RAND() * 1.0, 2) as avg_rating,
             CASE
                 WHEN s.shop_name LIKE '%tech%' OR s.shop_name LIKE '%electron%' THEN 'Electronics'
                 WHEN s.shop_name LIKE '%fashion%' OR s.shop_name LIKE '%cloth%' THEN 'Fashion'
@@ -753,7 +819,12 @@ async def get_featured_retailers(
         for retailer in results:
             retailer['logo'] = f"https://placekitten.com/200/200?retailer={retailer['shop_id']}"
             
-        return {"retailers": results}
+        response_data = {"retailers": results}
+        
+        # Cache the data for 1 hour (3600 seconds)
+        cache_service.set(cache_key, response_data, ttl_seconds=3600)
+        
+        return response_data
         
     except Exception as e:
         raise HTTPException(
@@ -907,6 +978,14 @@ async def get_search_suggestions(
     """
     Get popular and trending search suggestions.
     """
+    # Cache key for search suggestions
+    cache_key = "home:search-suggestions"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
+        
     # Since we don't have actual search data yet, this is mocked
     popular_searches = [
         "iPhone 15",
@@ -927,10 +1006,15 @@ async def get_search_suggestions(
         "Apple Vision Pro"
     ]
     
-    return {
+    response_data = {
         "popular_searches": popular_searches,
         "trending_searches": trending_searches
     }
+    
+    # Cache the data for 1 hour (3600 seconds)
+    cache_service.set(cache_key, response_data, ttl_seconds=3600)
+    
+    return response_data
 
 
 @router.get("/recommendations", response_model=RecommendationsResponse)
@@ -944,6 +1028,14 @@ async def get_personalized_recommendations(
     Get personalized product recommendations for authenticated users.
     Returns products recommended specifically for the authenticated user based on their behavior and preferences.
     """
+    # Create cache key with user ID and limit
+    user_id = user.get("sub")
+    cache_key = f"home:recommendations:{user_id}:limit{limit}"
+    
+    # Try to get from cache first
+    cached_data = cache_service.get(cache_key)
+    if cached_data:
+        return cached_data
     # Get user ID from the authenticated user - check multiple possible fields
     user_id = None
     if isinstance(user, dict):
