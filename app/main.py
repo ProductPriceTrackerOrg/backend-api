@@ -50,7 +50,7 @@ app = FastAPI(
 # In production, you should restrict origins to  frontend's actual domain for security.
 origins = [
     "http://localhost:3000",  #  Next.js development server
-    # "https://production-frontend-domain.com", # Add  production domain
+    "https://pricepulse.praneethanjana.me", # Add  production domain
 ]
 
 app.add_middleware(
