@@ -5,8 +5,10 @@ Implements Redis caching for frequently accessed data.
 import json
 import time
 import logging
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Union
-from datetime import timedelta
+
 import redis
 
 from app.config import settings
@@ -16,6 +18,23 @@ DEFAULT_CACHE_TTL = 600  # 10 minutes in seconds
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+def _json_serializer(value: Any) -> Any:
+    """Serialize unsupported types for JSON storage."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        return value.model_dump()
+    if hasattr(value, "dict") and callable(getattr(value, "dict")):
+        return value.dict()
+    if isinstance(value, set):
+        return list(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 class CacheService:
     """
@@ -86,7 +105,7 @@ class CacheService:
             
         start_time = time.time()
         try:
-            serialized = json.dumps(value)
+            serialized = json.dumps(value, default=_json_serializer)
             data_size = len(serialized)
             
             result = self.redis_client.setex(key, ttl_seconds, serialized)
