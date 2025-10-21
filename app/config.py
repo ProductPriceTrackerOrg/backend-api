@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     
     # Redis settings (optional)
     REDIS_URL: str = ""  # Empty string will disable Redis cache
+    CACHE_DEBUG: bool = False  # Set to True to enable cache debugging and logging
 
     model_config = SettingsConfigDict(env_file=".env")
 

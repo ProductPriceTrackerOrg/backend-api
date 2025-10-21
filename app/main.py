@@ -7,6 +7,8 @@ from app.api.v1 import users, home, newarrivals
 from app.config import settings
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPICallError
+# Import admin routes
+from app.api.v1.admin import routes as admin_routes
 
 # --- 2. BigQuery Client Initialization ---
 # Explicitly load the credentials file
@@ -48,7 +50,7 @@ app = FastAPI(
 # In production, you should restrict origins to  frontend's actual domain for security.
 origins = [
     "http://localhost:3000",  #  Next.js development server
-    # "https://production-frontend-domain.com", # Add  production domain
+    "https://pricepulse.praneethanjana.me", # Add  production domain
 ]
 
 app.add_middleware(
@@ -114,6 +116,7 @@ from app.api.v1 import buyer_central
 
 app.include_router(buyer_central.router, prefix="/api/v1/buyer-central", tags=["Buyer Central"])
 
+app.include_router(admin_routes.router, prefix="/api/v1", tags=["Admin"])
 
 @app.get("/health")
 async def health_check():

@@ -71,3 +71,6 @@ temp/
 
 # Node modules (if using any JavaScript tools)
 node_modules/
+
+SSH key generate
+SSH key generate.pub
